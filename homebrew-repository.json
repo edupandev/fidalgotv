@@ -1,0 +1,11 @@
+{
+  "packages": [
+    {
+      "id": "br.com.fidalgo.tv",
+      "title": "fidalGO TV",
+      "iconUri": "https://raw.githubusercontent.com/SEU_USUARIO/fidalgo-webos-lg/main/assets/icon130.png",
+      "manifestUrl": "https://github.com/SEU_USUARIO/fidalgo-webos-lg/releases/latest/download/br.com.fidalgo.tv.manifest.json",
+      "shortDescription": "fidalGO TV para LG webOS: 350+ canais ao vivo do Brasil, Filmes, Séries e Animes integrados com seus addons."
+    }
+  ]
+}

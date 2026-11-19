@@ -1,0 +1,1851 @@
+// @vitest-environment jsdom
+import 'fake-indexeddb/auto';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
+import type { Channel, EpgSource } from '../types';
+import { CONFIG } from '../config';
+import {
+  cacheRecordRef,
+  catalogCacheGeneration,
+  clearAllCachedData,
+  clearCachedCatalog,
+  clearCachedEpg,
+  clearCachedPlaylist,
+  clearCachedStreamMimes,
+  clearCachedChannelHealth,
+  flushCacheWrites,
+  getCacheUsage,
+  getCachedCatalog,
+  getCachedCatalogMetadata,
+  getCachedEpg,
+  getCachedPlaylist,
+  openCachedPlaylist,
+  getCachedStreamMime,
+  getCachedChannelHealth,
+  getCachedSubtitle,
+  onPlaylistCacheWritten,
+  reserveSearchIndex,
+  settleSearchIndex,
+  playlistCacheToken,
+  scheduleCachedPlaylist,
+  setCachedCatalog,
+  setCachedCatalogState,
+  setCachedEpg,
+  setCachedPlaylist,
+  setCachedStreamMime,
+  setCachedChannelHealth,
+  setCachedSubtitle,
+} from './idb-cache';
+import {
+  CACHE_META_STORE,
+  CATALOG_STORE,
+  CHANNEL_HEALTH_STORE,
+  openPersistenceDb,
+  requestResult,
+  SEARCH_INDEX_STORE,
+  STREAM_MIME_STORE,
+  SUBTITLE_STORE,
+  transactionDone,
+} from './idb-database';
+import { cachedNameDocuments } from '../workers/search-cache-documents';
+import { buildSourceIndex } from '../workers/search-source-index';
+import { IdbSearchCacheReader } from '../workers/search-cache-reader';
+import { holdValue, measureHeldValue, releaseHeldValue, writeHeldValue } from '../workers/held-values';
+import { holdRecord, type HeldWriteRequest, type HeldWriteResult } from './held-records';
+import { serializedBytes } from '../utils/serialized-bytes';
+import { isPackedEpg, packEpg, packEpgFilter } from './epg-cache-codec';
+import { PLAYLIST_CHUNK_SIZE, PLAYLIST_FIRST_CHUNK_SIZE, playlistChunkKey } from './playlist-chunks';
+
+const channel = (id: string): Channel => ({
+  id,
+  name: 'Alpha',
+  logo: '',
+  group: '',
+  url: 'http://host/a',
+  extras: null,
+  playlistIds: ['p1'],
+  catchup: '',
+  catchupSource: '',
+  catchupDays: 0,
+});
+
+// The webkitTemporaryStorage quota measured on the webOS 4 emulator.
+const EMULATOR_QUOTA = 8_547_530;
+const STANDARD_QUOTA = 768 * 1024 * 1024;
+type QuotaQuery = (success: (usage: number, quota: number) => void, error: () => void) => void;
+
+function stubNavigator(name: 'storage' | 'webkitTemporaryStorage', value: unknown): void {
+  Object.defineProperty(navigator, name, { configurable: true, value });
+}
+
+function usePrefixedQuota(query: QuotaQuery): void {
+  stubNavigator('storage', undefined);
+  stubNavigator('webkitTemporaryStorage', { queryUsageAndQuota: query });
+}
+
+// Runs past the minute the previous estimate stays cached for.
+async function withQuota<T>(quota: number, usage: number, run: () => Promise<T>): Promise<T> {
+  const previous = Object.getOwnPropertyDescriptor(navigator, 'storage');
+  stubNavigator('storage', { estimate: async () => ({ usage, quota }) });
+  const later = Date.now() + 60 * 1000;
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(later);
+  try {
+    return await run();
+  } finally {
+    clock.mockRestore();
+    if (previous) Object.defineProperty(navigator, 'storage', previous);
+  }
+}
+
+describe('idb-cache', () => {
+  beforeEach(async () => {
+    localStorage.clear();
+    // Keeps the 384 MiB budget the tests below were written against.
+    stubNavigator('storage', { estimate: async () => ({ usage: 0, quota: STANDARD_QUOTA }) });
+    await clearAllCachedData();
+  });
+
+  afterEach(() => {
+    Reflect.deleteProperty(navigator, 'storage');
+    delete (navigator as Navigator & { webkitTemporaryStorage?: unknown }).webkitTemporaryStorage;
+  });
+
+  describe('storage quota', () => {
+    const MiB = 1024 * 1024;
+    const bigChannel = (bytes: number): Channel => ({ ...channel('ch1'), name: 'x'.repeat(bytes) });
+
+    it('takes only the quota from webkitTemporaryStorage', async () => {
+      usePrefixedQuota((success) => success(1234, EMULATOR_QUOTA));
+
+      expect(await getCacheUsage()).toMatchObject({
+        quotaBytes: EMULATOR_QUOTA,
+        budgetBytes: Math.floor(EMULATOR_QUOTA * 0.25),
+        originUsageBytes: null,
+      });
+    });
+
+    it('reports no budget when no quota is reported', async () => {
+      usePrefixedQuota((_success, error) => error());
+      expect((await getCacheUsage()).budgetBytes).toBeNull();
+
+      stubNavigator('webkitTemporaryStorage', undefined);
+      expect((await getCacheUsage()).budgetBytes).toBeNull();
+    });
+
+    it('stops asking a prefixed API that never answers', async () => {
+      const query = vi.fn<QuotaQuery>();
+      usePrefixedQuota(query);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        const pending = getCacheUsage();
+        await vi.advanceTimersByTimeAsync(1000);
+        expect((await pending).budgetBytes).toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(warn.mock.calls.map(call => call.join(' '))).toContainEqual(
+        expect.stringContaining('event=persistence.cache.quota.unavailable reason=timeout'),
+      );
+      warn.mockRestore();
+
+      await getCacheUsage();
+      expect(query).toHaveBeenCalledTimes(1);
+    });
+
+    it('shares one pending prefixed query between callers', async () => {
+      const query = vi.fn<QuotaQuery>();
+      usePrefixedQuota(query);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        const pending = Promise.all([getCacheUsage(), getCacheUsage()]);
+        await vi.advanceTimersByTimeAsync(1000);
+        await pending;
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(query).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledTimes(1);
+      warn.mockRestore();
+    });
+
+    it('trusts a prefixed API again once its late answer arrives', async () => {
+      const answers: Array<(usage: number, quota: number) => void> = [];
+      const query = vi.fn<QuotaQuery>((success) => { answers.push(success); });
+      usePrefixedQuota(query);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        const pending = getCacheUsage();
+        await vi.advanceTimersByTimeAsync(1000);
+        await pending;
+      } finally {
+        vi.useRealTimers();
+        warn.mockRestore();
+      }
+
+      answers[0](0, EMULATOR_QUOTA);
+      expect((await getCacheUsage()).quotaBytes).toBe(EMULATOR_QUOTA);
+      expect(query).toHaveBeenCalledTimes(1);
+    });
+
+    it('prunes nothing for a budget no quota grounds', async () => {
+      stubNavigator('storage', undefined);
+      await setCachedSubtitle('subdl:1', 'x'.repeat(2 * MiB));
+      await setCachedPlaylist([bigChannel(3 * MiB)]);
+
+      expect(await getCachedPlaylist(null)).not.toBeNull();
+      expect(await getCachedSubtitle('subdl:1')).not.toBeNull();
+    });
+
+    it('never evicts the playlist to fit the budget', async () => {
+      // A 2 MiB budget.
+      usePrefixedQuota((success) => success(0, 8 * MiB));
+      await setCachedPlaylist([bigChannel(1.5 * MiB)]);
+      await setCachedSubtitle('subdl:1', 'x'.repeat(MiB / 2));
+      await setCachedCatalog('x1|vod_categories', ['x'.repeat(MiB / 2)]);
+
+      expect(await getCachedPlaylist(null)).not.toBeNull();
+      expect(await getCachedSubtitle('subdl:1')).toBeNull();
+      expect(await getCachedCatalog('x1|vod_categories')).not.toBeNull();
+    });
+
+    it('prunes only the overrun from a budget of a few MiB', async () => {
+      // A 2 MiB budget.
+      usePrefixedQuota((success) => success(0, 8 * MiB));
+      await setCachedPlaylist([bigChannel(MiB)]);
+      await setCachedEpg('http://host/epg', { channels: {}, programmes: {} });
+      await setCachedCatalog('x1|vod_categories', ['x'.repeat(0.4 * MiB)]);
+      // The older catalog is the one pruned, so the clock must move on.
+      await new Promise(resolve => setTimeout(resolve, 2));
+      await setCachedCatalog('x1|series_categories', ['x'.repeat(0.4 * MiB)]);
+      await setCachedSubtitle('subdl:1', 'x'.repeat(0.3 * MiB));
+
+      expect(await getCachedCatalog('x1|vod_categories')).toBeNull();
+      expect(await getCachedCatalog('x1|series_categories')).not.toBeNull();
+      expect(await getCachedEpg('http://host/epg')).not.toBeNull();
+    });
+
+    it('makes room for a page copy that grew after the worker measured it', async () => {
+      // A 2 MiB budget.
+      usePrefixedQuota((success) => success(0, 8 * MiB));
+      await setCachedSubtitle('subdl:1', 'x'.repeat(MiB / 2));
+      const channels = [channel('ch1')];
+      holdRecord(channels, {
+        bytes: serializedBytes(channels),
+        write: () => Promise.resolve('missing'),
+        release: () => undefined,
+      });
+      Object.assign(channels[0], { name: 'x'.repeat(1.6 * MiB) });
+
+      await setCachedPlaylist(channels);
+
+      expect(await getCachedPlaylist(null)).not.toBeNull();
+      expect(await getCachedSubtitle('subdl:1')).toBeNull();
+    });
+
+    it('stretches the budget over a playlist larger than it', async () => {
+      usePrefixedQuota((success) => success(0, 8 * MiB));
+      await setCachedPlaylist([bigChannel(3 * MiB)]);
+
+      const usage = await getCacheUsage();
+      expect(usage.budgetBytes).toBe(usage.categories.playlist.bytes);
+    });
+
+    it('limits a search index only by the engine when no quota is known', async () => {
+      stubNavigator('storage', undefined);
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(1);
+      await setCachedCatalog('x1|vod_all', ['x1|vod_all'], null);
+      clock.mockRestore();
+      await setCachedPlaylist([bigChannel(5 * MiB)]);
+
+      expect(await reserveSearchIndex({
+        key: 'catalog-cache|x1|vod_all|1|v1',
+        prefix: 'catalog-cache|x1|vod_all|',
+        bytes: MiB,
+      })).not.toBeNull();
+    });
+
+    it('stores a record the budget cannot hold without flushing the rest', async () => {
+      usePrefixedQuota((success) => success(0, 8 * MiB));
+      await setCachedSubtitle('subdl:1', 'kept');
+      await setCachedCatalog('x1|vod_all', ['x'.repeat(3 * MiB)]);
+
+      expect(await getCachedSubtitle('subdl:1')).toBe('kept');
+      expect(await getCachedCatalog('x1|vod_all')).not.toBeNull();
+    });
+  });
+
+  it('uses the next schema version after the published v3 database', async () => {
+    const db = await openPersistenceDb();
+    expect(db?.version).toBe(7);
+    expect(db?.objectStoreNames.contains(STREAM_MIME_STORE)).toBe(true);
+    expect(db?.objectStoreNames.contains('search-index-cache')).toBe(true);
+  });
+
+  it('stores channel health records separately and accounts for them', async () => {
+    await setCachedChannelHealth({
+      ch1: { status: 'healthy' },
+      ch2: { status: 'suspect' },
+    });
+    await setCachedChannelHealth({ ch1: { status: 'unavailable' } });
+
+    expect(await getCachedChannelHealth()).toEqual({
+      ch1: { status: 'unavailable' },
+      ch2: { status: 'suspect' },
+    });
+    expect((await getCacheUsage()).categories.health.entries).toBe(2);
+
+    await clearCachedChannelHealth();
+    expect(await getCachedChannelHealth()).toEqual({});
+    expect((await getCacheUsage()).categories.health.entries).toBe(0);
+  });
+
+  it('treats a channel health cache read failure as an empty cache', async () => {
+    const transaction = IDBDatabase.prototype.transaction;
+    const transactionSpy = vi.spyOn(IDBDatabase.prototype, 'transaction').mockImplementation(function (
+      this: IDBDatabase,
+      storeNames: string | Iterable<string>,
+      mode?: IDBTransactionMode,
+      options?: IDBTransactionOptions,
+    ) {
+      if (storeNames === CHANNEL_HEALTH_STORE) throw new Error('read failed');
+      return transaction.call(this, storeNames, mode, options);
+    });
+
+    try {
+      expect(await getCachedChannelHealth()).toEqual({});
+    } finally {
+      transactionSpy.mockRestore();
+    }
+  });
+
+  it('round-trips a cached subtitle', async () => {
+    await setCachedSubtitle('subdl:1', 'WEBVTT\n\nhi');
+    expect(await getCachedSubtitle('subdl:1')).toContain('hi');
+    expect(await getCachedSubtitle('missing')).toBeNull();
+  });
+
+  it('stores stream MIME probes in their cache store and expires them', async () => {
+    await setCachedStreamMime('http://host/live', 'video/mp2t');
+    expect(await getCachedStreamMime('http://host/live')).toBe('video/mp2t');
+    expect((await getCacheUsage()).categories.catalog.entries).toBe(1);
+
+    const db = await openPersistenceDb();
+    expect(db).not.toBeNull();
+    const readTx = db!.transaction(STREAM_MIME_STORE, 'readonly');
+    const record = await requestResult(
+      readTx.objectStore(STREAM_MIME_STORE).get('http://host/live'),
+    );
+    const writeTx = db!.transaction(STREAM_MIME_STORE, 'readwrite');
+    writeTx.objectStore(STREAM_MIME_STORE).put({ ...record, expiresAt: Date.now() - 1 });
+    await transactionDone(writeTx);
+
+    expect(await getCachedStreamMime('http://host/live')).toBeNull();
+    expect((await getCacheUsage()).categories.catalog.entries).toBe(0);
+  });
+
+  it('clears stream MIME records without clearing catalog records', async () => {
+    await setCachedCatalog('x1|vod_categories', ['a']);
+    await setCachedStreamMime('http://host/live', 'video/mp2t');
+
+    await clearCachedStreamMimes();
+
+    expect(await getCachedStreamMime('http://host/live')).toBeNull();
+    expect(await getCachedCatalog('x1|vod_categories')).not.toBeNull();
+    expect((await getCacheUsage()).categories.catalog.entries).toBe(1);
+  });
+
+  it('clears catalog records without clearing stream MIME records', async () => {
+    await setCachedCatalog('x1|vod_categories', ['a']);
+    await setCachedStreamMime('http://host/live', 'video/mp2t');
+
+    await clearCachedCatalog();
+
+    expect(await getCachedCatalog('x1|vod_categories')).toBeNull();
+    expect(await getCachedStreamMime('http://host/live')).toBe('video/mp2t');
+  });
+
+  it('advances the catalog generation on every catalog clear', async () => {
+    const before = catalogCacheGeneration();
+    await clearCachedCatalog();
+    expect(catalogCacheGeneration()).toBe(before + 1);
+    await clearAllCachedData();
+    expect(catalogCacheGeneration()).toBe(before + 2);
+  });
+
+  it('includes stream MIME records in the shared cache eviction pass', async () => {
+    await setCachedStreamMime('http://host/live', 'video/mp2t');
+    await withQuota(100, 0, async () => {
+      await setCachedCatalog('x1|vod_categories', ['a']);
+    });
+
+    expect(await getCachedStreamMime('http://host/live')).toBeNull();
+    expect(await getCachedCatalog('x1|vod_categories')).not.toBeNull();
+
+    // The clock moved back past the tiny quota's estimate, which expires.
+    await setCachedSubtitle('subdl:1', 'a');
+    expect(await getCachedCatalog('x1|vod_categories')).not.toBeNull();
+  });
+
+  it('removes an expired subtitle instead of serving it', async () => {
+    await setCachedSubtitle('subdl:expired', 'WEBVTT\n\nold');
+    const db = await openPersistenceDb();
+    expect(db).not.toBeNull();
+    const readTx = db!.transaction(SUBTITLE_STORE, 'readonly');
+    const record = await requestResult(readTx.objectStore(SUBTITLE_STORE).get('subdl:expired'));
+    const writeTx = db!.transaction(SUBTITLE_STORE, 'readwrite');
+    writeTx.objectStore(SUBTITLE_STORE).put({
+      ...record,
+      expiresAt: Date.now() - 1,
+    });
+    await transactionDone(writeTx);
+
+    expect(await getCachedSubtitle('subdl:expired')).toBeNull();
+    expect((await getCacheUsage()).categories.subtitle.entries).toBe(0);
+  });
+
+  it('clears every cache when resetting the app', async () => {
+    await setCachedEpg('http://host/epg', { channels: {}, programmes: {} });
+    await setCachedCatalog('x1|categories', ['a']);
+    await setCachedSubtitle('subdl:2', 'WEBVTT\n\nhi');
+    await setCachedChannelHealth({ ch1: { status: 'healthy' } });
+
+    await clearAllCachedData();
+
+    expect(await getCachedEpg('http://host/epg')).toBeNull();
+    expect(await getCachedCatalog('x1|categories')).toBeNull();
+    expect(await getCachedSubtitle('subdl:2')).toBeNull();
+    expect(await getCachedChannelHealth()).toEqual({});
+  });
+
+  it('stores parsed playlists outside localStorage', async () => {
+    const channels = [channel('ch1')];
+    const sources = [{ url: 'http://host/epg', playlistIds: ['p1'], kind: 'm3u' as const }];
+
+    expect(await setCachedPlaylist(channels, sources)).toBe(true);
+
+    expect(await getCachedPlaylist()).toEqual({
+      channels,
+      epgSources: sources,
+      timestamp: expect.any(Number),
+    });
+    expect(localStorage.getItem('iptv_cached_playlist')).toBeNull();
+  });
+
+  describe('chunked playlist', () => {
+    const many = (count: number): Channel[] =>
+      Array.from({ length: count }, (_, i) => channel(`ch${String(i)}`));
+
+    async function playlistKeys(): Promise<string[]> {
+      const db = await openPersistenceDb();
+      const tx = db!.transaction('playlist-cache', 'readonly');
+      return (await requestResult(tx.objectStore('playlist-cache').getAllKeys())).map(String);
+    }
+
+    async function playlistRecord(key: string): Promise<Record<string, unknown> | undefined> {
+      const db = await openPersistenceDb();
+      const tx = db!.transaction('playlist-cache', 'readonly');
+      return await requestResult(tx.objectStore('playlist-cache').get(key)) as
+        Record<string, unknown> | undefined;
+    }
+
+    async function editPlaylistStore(edit: (store: IDBObjectStore) => void): Promise<void> {
+      const db = await openPersistenceDb();
+      const tx = db!.transaction('playlist-cache', 'readwrite');
+      edit(tx.objectStore('playlist-cache'));
+      await transactionDone(tx);
+    }
+
+    it('stores a large playlist as chunks and reads them back a chunk at a time', async () => {
+      const channels = many(PLAYLIST_FIRST_CHUNK_SIZE + PLAYLIST_CHUNK_SIZE + 5);
+      await setCachedPlaylist(channels, [], 1000, null);
+
+      expect(await playlistKeys()).toEqual([
+        'combined-v5',
+        playlistChunkKey('combined-v5', 0),
+        playlistChunkKey('combined-v5', 1),
+        playlistChunkKey('combined-v5', 2),
+      ]);
+      expect((await playlistRecord('combined-v5'))?.data).not.toHaveProperty('channels');
+      const cached = await openCachedPlaylist(null);
+      expect(cached?.channelCount).toBe(channels.length);
+      const sizes: number[] = [];
+      const read = await cached!.readChannels((chunk) => { sizes.push(chunk.length); });
+      expect(sizes).toEqual([PLAYLIST_FIRST_CHUNK_SIZE, PLAYLIST_CHUNK_SIZE, 5]);
+      expect(read).toEqual(channels);
+      expect(cacheRecordRef(read!)).toEqual({ store: 'playlist-cache', key: 'combined-v5', timestamp: 1000 });
+    });
+
+    it('evicts playlists cached under older keys after a write, once a launch', async () => {
+      await editPlaylistStore((store) => {
+        store.put({ key: 'combined-v4', timestamp: 1, data: { chunkCount: 1, channelCount: 1 }, expiresAt: null });
+        store.put({ key: playlistChunkKey('combined-v4', 0), data: [channel('old')] });
+        store.put({ key: playlistChunkKey('combined-v3', 0), data: [channel('older')] });
+      });
+
+      await setCachedPlaylist(many(3), [], 1000, null);
+      await flushCacheWrites();
+      expect(await playlistKeys()).toEqual(['combined-v5', playlistChunkKey('combined-v5', 0)]);
+
+      // Later saves in the same launch do not scan the store again.
+      await editPlaylistStore(store => store.put({ key: 'combined-v3', timestamp: 1, data: {} }));
+      await setCachedPlaylist(many(3), [], 2000, null);
+      await flushCacheWrites();
+      expect(await playlistKeys()).toContain('combined-v3');
+    });
+
+    it('counts a playlist cached under an older key as a miss', async () => {
+      await editPlaylistStore((store) => {
+        store.put({ key: 'combined-v4', timestamp: 1, data: { chunkCount: 1, channelCount: 1 }, expiresAt: null });
+        store.put({ key: playlistChunkKey('combined-v4', 0), data: [channel('old')] });
+      });
+
+      expect(await openCachedPlaylist(null)).toBeNull();
+    });
+
+    it('drops the chunks a shorter playlist no longer uses', async () => {
+      await setCachedPlaylist(many(PLAYLIST_FIRST_CHUNK_SIZE + PLAYLIST_CHUNK_SIZE + 5), [], 1000, null);
+      await setCachedPlaylist(many(3), [], 2000, null);
+
+      expect(await playlistKeys()).toEqual(['combined-v5', playlistChunkKey('combined-v5', 0)]);
+      expect((await getCachedPlaylist(null))?.channels).toEqual(many(3));
+    });
+
+    it('counts a playlist missing a chunk as uncached', async () => {
+      await setCachedPlaylist(many(PLAYLIST_FIRST_CHUNK_SIZE + 1), [], 1000, null);
+      await editPlaylistStore(store => store.delete(playlistChunkKey('combined-v5', 1)));
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      try {
+        expect(await getCachedPlaylist(null)).toBeNull();
+        expect(warn.mock.calls.map(call => call.filter(part => typeof part === 'string').join(' ')))
+          .toContainEqual(expect.stringContaining(
+            'event=playlist.cache.read.failed reason=chunk_missing chunk=1 chunks=2',
+          ));
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('tells a playlist cleared while it is read from a missing chunk', async () => {
+      await setCachedPlaylist(many(PLAYLIST_FIRST_CHUNK_SIZE + 1), [], 1000, null);
+      const cached = await openCachedPlaylist(null);
+      await clearCachedPlaylist();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      try {
+        expect(await cached!.readChannels()).toBeNull();
+        expect(warn.mock.calls.map(call => call.filter(part => typeof part === 'string').join(' ')))
+          .toContainEqual(expect.stringContaining('event=playlist.cache.read.failed reason=cleared chunk=0'));
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('lets the search worker read nothing of a playlist whose chunk is from another write', async () => {
+      await setCachedPlaylist(many(PLAYLIST_FIRST_CHUNK_SIZE + 1), [], 1000, null);
+      const chunk = await playlistRecord(playlistChunkKey('combined-v5', 1));
+      await editPlaylistStore(store => store.put({ ...chunk, timestamp: 999 }));
+
+      expect(await new IdbSearchCacheReader(indexedDB)
+        .read({ store: 'playlist-cache', key: 'combined-v5' }, 5000)).toBeNull();
+    });
+
+    it('counts a chunk left by another write as missing', async () => {
+      await setCachedPlaylist(many(PLAYLIST_FIRST_CHUNK_SIZE + 1), [], 1000, null);
+      const stale = await playlistRecord(playlistChunkKey('combined-v5', 1));
+      await setCachedPlaylist(many(PLAYLIST_FIRST_CHUNK_SIZE + 1), [], 2000, null);
+      await editPlaylistStore(store => store.put(stale));
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+      expect(await getCachedPlaylist(null)).toBeNull();
+      warn.mockRestore();
+    });
+
+    it('removes a playlist\'s chunks when a full disk evicts it', async () => {
+      await setCachedPlaylist(many(PLAYLIST_FIRST_CHUNK_SIZE + 1), [], 1000, null);
+      const put = IDBObjectStore.prototype.put;
+      let failed = false;
+      const spy = vi.spyOn(IDBObjectStore.prototype, 'put').mockImplementation(function (
+        this: IDBObjectStore,
+        ...args: Parameters<IDBObjectStore['put']>
+      ) {
+        if (this.name === CATALOG_STORE && !failed) {
+          failed = true;
+          throw new DOMException('full', 'QuotaExceededError');
+        }
+        return put.apply(this, args);
+      });
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      try {
+        await setCachedCatalog('x1|vod_all', [{ name: 'Alpha' }], null);
+      } finally {
+        spy.mockRestore();
+        warn.mockRestore();
+      }
+
+      expect(failed).toBe(true);
+      expect(await playlistKeys()).toEqual([]);
+    });
+
+    it('lets the search worker read a chunked playlist whole', async () => {
+      const channels = many(PLAYLIST_FIRST_CHUNK_SIZE + 1);
+      await setCachedPlaylist(channels, [], 1000, null);
+
+      const raw = await new IdbSearchCacheReader(indexedDB)
+        .read({ store: 'playlist-cache', key: 'combined-v5' }, 5000);
+      expect((raw?.data as { channels: Channel[] }).channels).toEqual(channels);
+    });
+
+    it('counts the chunks into the playlist when it rebuilds the accounting', async () => {
+      await setCachedPlaylist(many(PLAYLIST_FIRST_CHUNK_SIZE + 1), [], 1000, null);
+      const bytes = (await getCacheUsage()).categories.playlist.bytes;
+      const db = await openPersistenceDb();
+      const tx = db!.transaction(CACHE_META_STORE, 'readwrite');
+      tx.objectStore(CACHE_META_STORE).clear();
+      await transactionDone(tx);
+
+      vi.resetModules();
+      const fresh = await import('./idb-cache');
+      const usage = await fresh.getCacheUsage();
+      // The chunks' own keys add a little to what the write counted.
+      expect(usage.categories.playlist.entries).toBe(1);
+      expect(Math.abs(usage.categories.playlist.bytes - bytes)).toBeLessThan(bytes * 0.01);
+      // Eviction sizes the playlist by its head entry, so the chunks count there.
+      const metaTx = (await openPersistenceDb())!.transaction(CACHE_META_STORE, 'readonly');
+      const entry = await requestResult(
+        metaTx.objectStore(CACHE_META_STORE).get('entry:playlist-cache:combined-v5'),
+      ) as { byteSize: number };
+      expect(Math.abs(entry.byteSize - bytes)).toBeLessThan(bytes * 0.01);
+    });
+  });
+
+  it('remembers which record a cached playlist or catalog came from', async () => {
+    const channels = [channel('ch1')];
+    expect(cacheRecordRef(channels)).toBeNull();
+    await setCachedPlaylist(channels, [], 1234);
+    expect(cacheRecordRef(channels)).toEqual({
+      store: 'playlist-cache',
+      key: 'combined-v5',
+      timestamp: 1234,
+    });
+    const read = await getCachedPlaylist(null);
+    expect(read?.channels).not.toBe(channels);
+    expect(cacheRecordRef(read?.channels ?? [])).toEqual({
+      store: 'playlist-cache',
+      key: 'combined-v5',
+      timestamp: 1234,
+    });
+
+    const items = [{ name: 'Alpha' }];
+    await setCachedCatalog('x1|vod_all', items);
+    const stored = cacheRecordRef(items);
+    expect(stored).toMatchObject({ store: 'catalog-cache', key: 'x1|vod_all' });
+    const catalog = await getCachedCatalog<typeof items>('x1|vod_all');
+    expect(cacheRecordRef(catalog?.data ?? [])).toEqual({ ...stored, timestamp: catalog?.timestamp });
+  });
+
+  it('lets the search worker read the catalog records written here', async () => {
+    const items = [{ name: 'Alpha' }, { name: 'Bravo' }];
+    await setCachedCatalog('x1|vod_all', items);
+    await flushCacheWrites();
+    const record = cacheRecordRef(items)!;
+
+    const raw = await new IdbSearchCacheReader(indexedDB).read(record, 1200);
+    expect(cachedNameDocuments(buildSourceIndex(record, raw), {
+      record,
+      length: 2,
+      selection: null,
+      samples: { indices: [1], documents: [['Bravo']] },
+    })).toEqual(['alpha', 'bravo']);
+  });
+
+  it('packs the guides it writes and reads them back', async () => {
+    const data = {
+      channels: { ch1: { name: 'Alpha', icon: '' } },
+      programmes: { ch1: [{
+        start: new Date(1000), stop: new Date(2000), title: 'Bravo', description: '', category: '', icon: '',
+      }] },
+      tzOffsetMinutes: 0,
+    };
+    await setCachedEpg('http://host/e', data, null, 1000, null);
+    await flushCacheWrites();
+    const record = { store: 'epg-cache', key: 'http://host/e', timestamp: 1000 } as const;
+    const raw = await new IdbSearchCacheReader(indexedDB).read(record, 1200);
+
+    expect(isPackedEpg(raw?.data)).toBe(true);
+    expect((await getCachedEpg('http://host/e'))?.data).toEqual(data);
+    expect(buildSourceIndex(record, raw)).toMatchObject({ length: 1, runIds: ['ch1'] });
+
+  });
+
+  it('round-trips program catch-up ids through the guide cache', async () => {
+    const data = {
+      channels: { ch1: { name: 'Alpha', icon: '' } },
+      programmes: { ch1: [{
+        start: new Date(1000), stop: new Date(2000), title: 'Bravo', description: '', category: '', icon: '',
+        catchupId: 'p1',
+      }] },
+    };
+    await setCachedEpg('http://host/e', data, null, 1000, null);
+    await flushCacheWrites();
+    expect((await getCachedEpg('http://host/e'))?.data.programmes.ch1[0].catchupId).toBe('p1');
+  });
+
+  it('counts a guide in an older packed format or unpacked as a miss and drops it', async () => {
+    const data = { channels: {}, programmes: {} };
+    await setCachedEpg('http://host/e', data, null, 1000, null);
+    await flushCacheWrites();
+    const db = await openPersistenceDb();
+    const read = db!.transaction('epg-cache', 'readonly');
+    const record = await requestResult(read.objectStore('epg-cache').get('http://host/e')) as
+      { data: Record<string, unknown> };
+    const write = db!.transaction('epg-cache', 'readwrite');
+    write.objectStore('epg-cache').put({ ...record, url: 'http://host/v1', data: { ...record.data, format: 'epg-packed-1' } });
+    write.objectStore('epg-cache').put({ url: 'http://host/legacy', timestamp: 1000, data });
+    await transactionDone(write);
+
+    expect(await getCachedEpg('http://host/v1')).toBeNull();
+    expect(await getCachedEpg('http://host/legacy')).toBeNull();
+    expect((await getCachedEpg('http://host/e'))?.data).toEqual(data);
+    await flushCacheWrites();
+    const keys = db!.transaction('epg-cache', 'readonly').objectStore('epg-cache').getAllKeys();
+    expect(await requestResult(keys)).toEqual(['http://host/e']);
+  });
+
+  it('keeps partial catalog freshness separate from the worker record timestamp', async () => {
+    const items = [{ name: 'Alpha' }];
+    const state = { complete: false, refreshAfter: Date.now() + 60_000 };
+    await setCachedCatalog('x1|vod_all', items, null, state);
+
+    const cached = await getCachedCatalog('x1|vod_all');
+    expect(cached?.state).toEqual(state);
+    expect(cacheRecordRef(items)).toEqual({
+      store: 'catalog-cache', key: 'x1|vod_all', timestamp: cached?.timestamp,
+    });
+    const record = cacheRecordRef(items)!;
+    const raw = await new IdbSearchCacheReader(indexedDB).read(record, 1200);
+    expect(cachedNameDocuments(buildSourceIndex(record, raw), {
+      record,
+      length: 1,
+      selection: null,
+      samples: { indices: [0], documents: [['Alpha']] },
+    })).toEqual(['alpha']);
+  });
+
+  it('updates catalog retry metadata without writing the payload or changing its source version', async () => {
+    const items = [{ name: 'Alpha' }];
+    await setCachedCatalog('x1|vod_all', items, null, {
+      complete: false, refreshAfter: Date.now() + 60_000,
+    });
+    const ref = cacheRecordRef(items)!;
+    const state = { complete: false, refreshAfter: Date.now() + 120_000 };
+    const put = vi.spyOn(IDBObjectStore.prototype, 'put');
+    try {
+      expect(await setCachedCatalogState('x1|vod_all', ref.timestamp, state)).toBe(true);
+      expect(await getCachedCatalog('x1|vod_all')).toMatchObject({
+        timestamp: ref.timestamp, data: items, state,
+      });
+      expect(put.mock.calls.filter(([record], index) =>
+        (put.mock.contexts[index] as IDBObjectStore | undefined)?.name === CATALOG_STORE
+        && (record as { key?: unknown }).key === 'x1|vod_all')).toHaveLength(0);
+      expect(cacheRecordRef(items)).toEqual(ref);
+    } finally {
+      put.mockRestore();
+    }
+  });
+
+  it('reads renewed catalog freshness without reading the catalog payload', async () => {
+    const state = { complete: false, refreshAfter: Date.now() + 60_000 };
+    const items = [{ name: 'Alpha' }];
+    await setCachedCatalog('x1|vod_all', items, null, state);
+    const timestamp = cacheRecordRef(items)!.timestamp;
+    const get = vi.spyOn(IDBObjectStore.prototype, 'get');
+    try {
+      expect(await getCachedCatalogMetadata('x1|vod_all')).toEqual({ timestamp, state });
+      const renewed = { complete: true, refreshAfter: Date.now() + 60_000, freshSince: Date.now() };
+      expect(await setCachedCatalogState('x1|vod_all', timestamp, renewed, null)).toBe(true);
+      expect(await getCachedCatalogMetadata('x1|vod_all')).toEqual({ timestamp, state: renewed });
+      expect(await getCachedCatalogMetadata('x1|missing')).toBeNull();
+      expect(get.mock.calls.filter((_, index) =>
+        (get.mock.contexts[index] as IDBObjectStore | undefined)?.name === CATALOG_STORE))
+        .toHaveLength(0);
+    } finally {
+      get.mockRestore();
+    }
+    expect(await getCachedCatalog('x1|vod_all')).toMatchObject({ timestamp, state: { complete: true } });
+  });
+
+  it.each(['payload', 'metadata'] as const)('handles metadata read failure during a %s lookup', async mode => {
+    const items = [{ name: 'Alpha' }];
+    const state = { complete: false, refreshAfter: Date.now() + 60_000 };
+    await setCachedCatalog('x1|vod_all', items, null, state);
+    const timestamp = cacheRecordRef(items)!.timestamp;
+    const error = new Error('metadata read failed');
+    const get = IDBObjectStore.prototype.get;
+    const getSpy = vi.spyOn(IDBObjectStore.prototype, 'get').mockImplementation(function (
+      this: IDBObjectStore, key: IDBValidKey | IDBKeyRange,
+    ) {
+      if (this.name === CACHE_META_STORE && key === 'entry:catalog-cache:x1|vod_all') throw error;
+      return get.call(this, key);
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      if (mode === 'payload') {
+        await expect(getCachedCatalog('x1|vod_all')).resolves.toMatchObject({
+          timestamp, data: items, state,
+        });
+      } else {
+        await expect(getCachedCatalogMetadata('x1|vod_all')).resolves.toBeNull();
+      }
+      expect(warn).toHaveBeenCalledExactlyOnceWith(
+        '[CacheStorage]', 'Catalog metadata read failed', 'event=xtream.cache.read.failed',
+        'operation=read', 'category=catalog', 'reason=metadata', error,
+      );
+    } finally {
+      getSpy.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  it('backfills a legacy catalog version before using metadata-only freshness reads', async () => {
+    await setCachedCatalog('x1|vod_all', [{ name: 'Alpha' }]);
+    const db = (await openPersistenceDb())!;
+    const read = db.transaction(CACHE_META_STORE, 'readonly');
+    const legacy = await requestResult(
+      read.objectStore(CACHE_META_STORE).get('entry:catalog-cache:x1|vod_all'),
+    ) as Record<string, unknown>;
+    const timestamp = legacy.timestamp;
+    delete legacy.timestamp;
+    const write = db.transaction(CACHE_META_STORE, 'readwrite');
+    write.objectStore(CACHE_META_STORE).put(legacy);
+    await transactionDone(write);
+
+    expect(await getCachedCatalogMetadata('x1|vod_all')).toEqual({ timestamp });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const get = vi.spyOn(IDBObjectStore.prototype, 'get');
+    try {
+      expect(await getCachedCatalogMetadata('x1|vod_all')).toEqual({ timestamp });
+      expect(get.mock.calls.filter((_, index) =>
+        (get.mock.contexts[index] as IDBObjectStore | undefined)?.name === CATALOG_STORE))
+        .toHaveLength(0);
+    } finally {
+      get.mockRestore();
+    }
+  });
+
+  it('reports a failed catalog metadata renewal without changing the existing state', async () => {
+    const items = [{ name: 'Alpha' }];
+    const state = { complete: false, refreshAfter: Date.now() + 60_000 };
+    await setCachedCatalog('x1|vod_all', items, null, state);
+    const timestamp = cacheRecordRef(items)!.timestamp;
+    const transaction = IDBDatabase.prototype.transaction;
+    const transactionSpy = vi.spyOn(IDBDatabase.prototype, 'transaction').mockImplementation(function (
+      this: IDBDatabase,
+      storeNames: string | Iterable<string>,
+      mode?: IDBTransactionMode,
+      options?: IDBTransactionOptions,
+    ) {
+      if (storeNames === CACHE_META_STORE && mode === 'readwrite') throw new Error('write failed');
+      return transaction.call(this, storeNames, mode, options);
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      expect(await setCachedCatalogState('x1|vod_all', timestamp, {
+        complete: true, refreshAfter: Date.now() + 120_000,
+      })).toBe(false);
+      expect(warn).toHaveBeenCalledExactlyOnceWith(
+        '[CacheStorage]', 'Catalog cache write failed', 'event=xtream.cache.write.failed',
+        'operation=write', 'category=catalog', expect.any(Error),
+      );
+    } finally {
+      transactionSpy.mockRestore();
+      warn.mockRestore();
+    }
+    expect(await getCachedCatalogMetadata('x1|vod_all')).toEqual({ timestamp, state });
+  });
+
+  it('rejects stale catalog state updates after a replacement or cache clear', async () => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1000);
+    try {
+      const oldState = { complete: false, refreshAfter: 2000 };
+      await setCachedCatalog('x1|vod_all', [{ name: 'Alpha' }], null, oldState);
+      expect(await setCachedCatalogState('x1|vod_all', 1000, {
+        complete: false, refreshAfter: 3000,
+      })).toBe(true);
+      clock.mockReturnValue(1001);
+      const nextState = { complete: true, refreshAfter: 4000, freshSince: 1001 };
+      await setCachedCatalog('x1|vod_all', [{ name: 'Bravo' }], null, nextState);
+
+      expect(await setCachedCatalogState('x1|vod_all', 1000, oldState)).toBe(false);
+      expect((await getCachedCatalog('x1|vod_all'))?.state).toEqual(nextState);
+      await clearCachedCatalog();
+      expect(await setCachedCatalogState('x1|vod_all', 1001, nextState)).toBe(false);
+      expect((await getCacheUsage()).categories.catalog.entries).toBe(0);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it('keeps a renewed catalog out of expired eviction without changing its payload version', async () => {
+    const hour = 60 * 60 * 1000;
+    const initial = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(initial);
+    const storageDescriptor = Object.getOwnPropertyDescriptor(navigator, 'storage');
+    try {
+      const items = [{ name: 'Alpha' }];
+      await setCachedCatalog('x1|vod_all', items, hour, {
+        complete: true, freshSince: initial, refreshAfter: initial + hour,
+      });
+      await setCachedCatalog('x1|expired', ['x'.repeat(8 * 1024 * 1024)], 2 * hour);
+      const ref = cacheRecordRef(items)!;
+      clock.mockReturnValue(initial + 7 * hour);
+      const renewed = {
+        complete: true, freshSince: Date.now(), refreshAfter: Date.now() + 24 * hour,
+      };
+      expect(await setCachedCatalogState('x1|vod_all', ref.timestamp, renewed, 24 * hour)).toBe(true);
+      expect(await getCachedCatalog('x1|vod_all')).toMatchObject({
+        timestamp: ref.timestamp, data: items, state: renewed,
+      });
+      await new Promise(resolve => setTimeout(resolve, 0));
+
+      const db = (await openPersistenceDb())!;
+      const tx = db.transaction(CACHE_META_STORE, 'readonly');
+      const metadata = await requestResult(
+        tx.objectStore(CACHE_META_STORE).get('entry:catalog-cache:x1|vod_all'),
+      );
+      expect(metadata).toMatchObject({
+        timestamp: ref.timestamp, expiresAt: renewed.refreshAfter,
+      });
+
+      const used = (await getCacheUsage()).total.bytes;
+      Object.defineProperty(navigator, 'storage', {
+        configurable: true,
+        value: { estimate: async () => ({ usage: 0, quota: 2 * (used - 1024 * 1024) }) },
+      });
+      clock.mockReturnValue(initial + 8 * hour);
+      await setCachedCatalog('x1|vod_categories', [{ id: '1', name: 'Cat A' }]);
+
+      expect(await getCachedCatalog('x1|expired')).toBeNull();
+      expect(await getCachedCatalog('x1|vod_all')).toMatchObject({
+        timestamp: ref.timestamp, data: items, state: renewed,
+      });
+    } finally {
+      clock.mockRestore();
+      if (storageDescriptor) Object.defineProperty(navigator, 'storage', storageDescriptor);
+      else Reflect.deleteProperty(navigator, 'storage');
+    }
+  });
+
+  it('evaluates playlist freshness against the current refresh interval', async () => {
+    const channels = [channel('ch1')];
+    const timestamp = Date.now() - 2 * 60 * 60 * 1000;
+    await setCachedPlaylist(channels, [], timestamp, 24 * 60 * 60 * 1000);
+
+    expect(await getCachedPlaylist(60 * 60 * 1000)).toBeNull();
+    expect(await getCachedPlaylist(null)).toEqual({
+      channels,
+      epgSources: [],
+      timestamp,
+    });
+  });
+
+  it('defers playlist persistence until after worker idle termination', async () => {
+    const frames: FrameRequestCallback[] = [];
+    let delayedWrite = null as (() => void) | null;
+    const originalRequest = globalThis.requestAnimationFrame;
+    const originalCancel = globalThis.cancelAnimationFrame;
+    const originalSetTimeout = globalThis.setTimeout;
+    globalThis.requestAnimationFrame = vi.fn((callback: FrameRequestCallback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    globalThis.cancelAnimationFrame = vi.fn();
+    const timer = vi.spyOn(globalThis, 'setTimeout').mockImplementation(
+      ((callback: TimerHandler, delay?: number, ...args: unknown[]) => {
+        if (delay === CONFIG.PLAYLIST_CACHE_WRITE_DELAY_MS) {
+          delayedWrite = () => {
+            if (typeof callback === 'function') callback(...args);
+          };
+          return 1;
+        }
+        return originalSetTimeout(callback, delay, ...args);
+      }) as typeof setTimeout,
+    );
+    try {
+      scheduleCachedPlaylist([channel('ch1')]);
+      expect(await getCachedPlaylist()).toBeNull();
+
+      frames.shift()?.(0);
+      expect(await getCachedPlaylist()).toBeNull();
+
+      frames.shift()?.(16);
+      expect(await getCachedPlaylist()).toBeNull();
+      expect(timer).toHaveBeenCalledWith(
+        expect.any(Function),
+        CONFIG.PLAYLIST_CACHE_WRITE_DELAY_MS,
+      );
+
+      delayedWrite?.();
+      await flushCacheWrites();
+      expect(await getCachedPlaylist()).not.toBeNull();
+    } finally {
+      globalThis.requestAnimationFrame = originalRequest;
+      globalThis.cancelAnimationFrame = originalCancel;
+      timer.mockRestore();
+    }
+  });
+
+  it('does not serve a parsed playlist after its source configuration changes', async () => {
+    localStorage.setItem('iptv_playlists', JSON.stringify([
+      { id: 'p1', name: 'Alpha', url: 'http://host/a' },
+    ]));
+    await setCachedPlaylist([channel('ch1')]);
+
+    localStorage.setItem('iptv_playlists', JSON.stringify([
+      { id: 'p2', name: 'Bravo', url: 'http://host/b' },
+    ]));
+
+    expect(await getCachedPlaylist()).toBeNull();
+  });
+
+  it('binds a delayed playlist write to the configuration that produced it', async () => {
+    const frames: FrameRequestCallback[] = [];
+    let delayedWrite = null as (() => void) | null;
+    const originalRequest = globalThis.requestAnimationFrame;
+    const originalCancel = globalThis.cancelAnimationFrame;
+    const originalSetTimeout = globalThis.setTimeout;
+    globalThis.requestAnimationFrame = vi.fn((callback: FrameRequestCallback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    globalThis.cancelAnimationFrame = vi.fn();
+    const timer = vi.spyOn(globalThis, 'setTimeout').mockImplementation(
+      ((callback: TimerHandler, delay?: number, ...args: unknown[]) => {
+        if (delay === CONFIG.PLAYLIST_CACHE_WRITE_DELAY_MS) {
+          delayedWrite = () => {
+            if (typeof callback === 'function') callback(...args);
+          };
+          return 1;
+        }
+        return originalSetTimeout(callback, delay, ...args);
+      }) as typeof setTimeout,
+    );
+    try {
+      localStorage.setItem('iptv_playlists', JSON.stringify([
+        { id: 'p1', name: 'Alpha', url: 'http://host/a' },
+      ]));
+      scheduleCachedPlaylist([channel('ch1')]);
+      frames.shift()?.(0);
+      frames.shift()?.(16);
+
+      localStorage.setItem('iptv_playlists', JSON.stringify([
+        { id: 'p2', name: 'Bravo', url: 'http://host/b' },
+      ]));
+      delayedWrite?.();
+      await flushCacheWrites();
+
+      expect(await getCachedPlaylist()).toBeNull();
+    } finally {
+      globalThis.requestAnimationFrame = originalRequest;
+      globalThis.cancelAnimationFrame = originalCancel;
+      timer.mockRestore();
+    }
+  });
+
+  it('drops a refresh result whose sources changed while it was loading', async () => {
+    localStorage.setItem('iptv_playlists', JSON.stringify([
+      { id: 'p1', name: 'Alpha', url: 'http://host/a' },
+    ]));
+    const token = playlistCacheToken();
+    localStorage.setItem('iptv_playlists', JSON.stringify([
+      { id: 'p2', name: 'Bravo', url: 'http://host/b' },
+    ]));
+
+    scheduleCachedPlaylist([channel('ch1')], [], Date.now(), null, token);
+    await flushCacheWrites();
+
+    expect(await getCachedPlaylist(null)).toBeNull();
+  });
+
+  it.each([
+    ['playlist cache', clearCachedPlaylist],
+    ['all caches', clearAllCachedData],
+  ])('drops a refresh result that was loading while clearing %s', async (_label, clear) => {
+    const token = playlistCacheToken();
+    await clear();
+
+    scheduleCachedPlaylist([channel('ch1')], [], Date.now(), null, token);
+    await flushCacheWrites();
+
+    expect(await getCachedPlaylist(null)).toBeNull();
+  });
+
+  it.each([
+    ['playlist cache', clearCachedPlaylist],
+    ['all caches', clearAllCachedData],
+  ])('does not restore a scheduled playlist after clearing %s', async (_label, clear) => {
+    const frames: FrameRequestCallback[] = [];
+    let delayedWrite = null as (() => void) | null;
+    const originalRequest = globalThis.requestAnimationFrame;
+    const originalCancel = globalThis.cancelAnimationFrame;
+    const originalSetTimeout = globalThis.setTimeout;
+    globalThis.requestAnimationFrame = vi.fn((callback: FrameRequestCallback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    globalThis.cancelAnimationFrame = vi.fn();
+    const timer = vi.spyOn(globalThis, 'setTimeout').mockImplementation(
+      ((callback: TimerHandler, delay?: number, ...args: unknown[]) => {
+        if (delay === CONFIG.PLAYLIST_CACHE_WRITE_DELAY_MS) {
+          delayedWrite = () => {
+            if (typeof callback === 'function') callback(...args);
+          };
+          return 1;
+        }
+        return originalSetTimeout(callback, delay, ...args);
+      }) as typeof setTimeout,
+    );
+    try {
+      scheduleCachedPlaylist([channel('ch1')]);
+      frames.shift()?.(0);
+      frames.shift()?.(16);
+
+      await clear();
+      delayedWrite?.();
+      await flushCacheWrites();
+
+      expect(await getCachedPlaylist()).toBeNull();
+    } finally {
+      globalThis.requestAnimationFrame = originalRequest;
+      globalThis.cancelAnimationFrame = originalCancel;
+      timer.mockRestore();
+    }
+  });
+
+  it('accounts for cache usage by category and resets it on clear', async () => {
+    await Promise.all([
+      setCachedPlaylist([channel('ch1')]),
+      setCachedEpg('http://host/epg', { channels: {}, programmes: {} }),
+      setCachedCatalog('x1|vod_categories', ['a']),
+      setCachedSubtitle('subdl:3', 'WEBVTT\n\nhello'),
+    ]);
+
+    const usage = await getCacheUsage();
+    expect(usage.total.bytes).toBeGreaterThan(0);
+    expect(usage.total.entries).toBe(4);
+    expect(usage.categories.playlist.entries).toBe(1);
+    expect(usage.categories.epg.entries).toBe(1);
+    expect(usage.categories.catalog.entries).toBe(1);
+    expect(usage.categories.subtitle.entries).toBe(1);
+    expect(usage.budgetBytes).toBe(384 * 1024 * 1024);
+
+    await clearAllCachedData();
+    expect((await getCacheUsage()).total).toEqual({ bytes: 0, entries: 0 });
+  });
+
+  it('accounts for serialized bytes without changing JSON sizing semantics', async () => {
+    await setCachedCatalog('x1|sizing', {
+      text: '\u0000"\\é😀',
+      values: [true, false, null, undefined, 12.5, Number.NaN],
+    });
+    const db = await openPersistenceDb();
+    expect(db).not.toBeNull();
+    const tx = db!.transaction([CATALOG_STORE, CACHE_META_STORE], 'readonly');
+    const record = await requestResult(tx.objectStore(CATALOG_STORE).get('x1|sizing')) as
+      Record<string, unknown>;
+    const meta = await requestResult(
+      tx.objectStore(CACHE_META_STORE).get('entry:catalog-cache:x1|sizing'),
+    ) as { byteSize: number };
+    const expected = new TextEncoder().encode(JSON.stringify({
+      ...record,
+      byteSize: 0,
+    })).byteLength;
+
+    expect(meta.byteSize).toBe(expected);
+  });
+
+  it('updates cache accounting without reading the previous payload', async () => {
+    await setCachedCatalog('x1|vod_all', Array.from({ length: 100 }, (_, index) => index));
+    const transaction = IDBDatabase.prototype.transaction;
+    const payloadReads: Array<{ stores: string | Iterable<string>; mode?: IDBTransactionMode }> = [];
+    const transactionSpy = vi.spyOn(IDBDatabase.prototype, 'transaction').mockImplementation(
+      function (
+        this: IDBDatabase,
+        storeNames: string | Iterable<string>,
+        mode?: IDBTransactionMode,
+        options?: IDBTransactionOptions,
+      ) {
+        if (mode === 'readonly'
+            && (storeNames === CATALOG_STORE
+              || (Array.isArray(storeNames) && storeNames.includes(CATALOG_STORE)))) {
+          payloadReads.push({ stores: storeNames, mode });
+        }
+        return transaction.call(this, storeNames, mode, options);
+      },
+    );
+
+    try {
+      await setCachedCatalog('x1|vod_all', Array.from({ length: 200 }, (_, index) => index));
+    } finally {
+      transactionSpy.mockRestore();
+    }
+
+    expect(payloadReads).toEqual([]);
+    expect((await getCacheUsage()).categories.catalog.entries).toBe(1);
+  });
+
+  describe('a list the app worker holds', () => {
+    // Wires the worker's side straight to the same database.
+    function holdInWorker(
+      items: object,
+      answer?: () => HeldWriteResult | null,
+      detached = false,
+      measured = false,
+      workerValue: object = items,
+    ) {
+      const reader = new IdbSearchCacheReader(indexedDB);
+      const token = holdValue(workerValue);
+      const write = vi.fn((request: HeldWriteRequest): Promise<HeldWriteResult> => {
+        const answered = answer?.();
+        if (answered) return Promise.resolve(answered);
+        return writeHeldValue(
+          { ...request, token, timeoutMs: 5000 },
+          (writes, timeoutMs) => reader.writeAll(writes, timeoutMs),
+        );
+      });
+      const release = vi.fn(() => releaseHeldValue(token));
+      const measure = vi.fn(() => Promise.resolve(measureHeldValue(token)));
+      holdRecord(items, {
+        ...(measured ? { measure } : { bytes: serializedBytes(workerValue) }),
+        write,
+        release,
+        ...(detached ? { detached } : {}),
+      });
+      return { token, write, release, measure };
+    }
+
+    async function entryBytes(key: string, store = 'catalog-cache'): Promise<number> {
+      const db = await openPersistenceDb();
+      const tx = db!.transaction(CACHE_META_STORE, 'readonly');
+      const meta = await requestResult(
+        tx.objectStore(CACHE_META_STORE).get(`entry:${store}:${key}`),
+      ) as { byteSize: number };
+      return meta.byteSize;
+    }
+
+    const list = (): object[] => [{ id: '1', name: 'Alpha' }, { id: '2', name: 'Bravo \u00e9' }];
+
+    it('is written there, with no list sent back and the accounting of a page write', async () => {
+      await setCachedCatalog('x1|page', list(), null);
+      const items = list();
+      const held = holdInWorker(items);
+
+      await setCachedCatalog('x1|held', items, null);
+
+      expect(held.write).toHaveBeenCalledTimes(1);
+      expect(held.write.mock.calls[0][0].writes[0].value.data).toBeNull();
+      expect((await getCachedCatalog('x1|held'))?.data).toEqual(list());
+      expect(await entryBytes('x1|held')).toBe(await entryBytes('x1|page'));
+      const usage = await getCacheUsage();
+      expect(usage.categories.catalog).toEqual({ bytes: 2 * await entryBytes('x1|page'), entries: 2 });
+      expect(held.release).toHaveBeenCalledTimes(1);
+      expect(cacheRecordRef(items)).toMatchObject({ store: CATALOG_STORE, key: 'x1|held' });
+    });
+
+    it('writes held playlist channels beside the page\'s EPG sources', async () => {
+      const epg: EpgSource[] = [{ url: 'http://host/e', playlistIds: ['p1'], kind: 'm3u' }];
+      await setCachedPlaylist([channel('ch1'), channel('ch2')], epg, 1000, null);
+      const pageBytes = await entryBytes('combined-v5', 'playlist-cache');
+      const channels = [channel('ch1'), channel('ch2')];
+      const held = holdInWorker(channels);
+
+      await setCachedPlaylist(channels, epg, 1000, null);
+
+      expect(held.write).toHaveBeenCalledTimes(1);
+      const request = held.write.mock.calls[0][0];
+      expect(request.field).toBe('data.channels');
+      expect(request.writes[0].value.data).toMatchObject({ channels: null, epgSources: epg });
+      expect(await getCachedPlaylist(null)).toEqual({
+        channels: [channel('ch1'), channel('ch2')],
+        epgSources: epg,
+        timestamp: 1000,
+      });
+      expect(await entryBytes('combined-v5', 'playlist-cache')).toBe(pageBytes);
+      expect(held.release).toHaveBeenCalledTimes(1);
+    });
+
+    it('writes held playlist channels as chunks', async () => {
+      const channels = Array.from({ length: PLAYLIST_FIRST_CHUNK_SIZE + 1 }, (_, i) => channel(`ch${String(i)}`));
+      const held = holdInWorker(channels);
+
+      await setCachedPlaylist(channels, [], 1000, null);
+
+      expect(held.write.mock.calls[0][0].chunkKeyPath).toBe('key');
+      const db = await openPersistenceDb();
+      const keys = await requestResult(
+        db!.transaction('playlist-cache', 'readonly').objectStore('playlist-cache').getAllKeys(),
+      );
+      expect(keys.map(String)).toEqual([
+        'combined-v5',
+        playlistChunkKey('combined-v5', 0),
+        playlistChunkKey('combined-v5', 1),
+      ]);
+      expect((await getCachedPlaylist(null))?.channels).toEqual(channels);
+    });
+
+    it('lets the worker drop held channels whose scheduled write is cancelled', async () => {
+      const channels = [channel('ch1')];
+      const held = holdInWorker(channels);
+      scheduleCachedPlaylist(channels);
+      scheduleCachedPlaylist(channels);
+      expect(held.release).not.toHaveBeenCalled();
+
+      await clearCachedPlaylist();
+
+      expect(held.release).toHaveBeenCalledTimes(1);
+      await flushCacheWrites();
+      expect(held.write).not.toHaveBeenCalled();
+    });
+
+    it('drops held channels whose refresh went stale or was replaced', async () => {
+      const token = playlistCacheToken();
+      await clearCachedPlaylist();
+      const staleChannels = [channel('ch1')];
+      const staleHeld = holdInWorker(staleChannels);
+      scheduleCachedPlaylist(staleChannels, [], Date.now(), null, token);
+      expect(staleHeld.release).toHaveBeenCalledTimes(1);
+
+      const first = [channel('ch1')];
+      const firstHeld = holdInWorker(first);
+      scheduleCachedPlaylist(first);
+      const second = [channel('ch2')];
+      const secondHeld = holdInWorker(second);
+      scheduleCachedPlaylist(second);
+      expect(firstHeld.release).toHaveBeenCalledTimes(1);
+      expect(secondHeld.release).not.toHaveBeenCalled();
+
+      await flushCacheWrites();
+      expect(firstHeld.write).not.toHaveBeenCalled();
+      expect(secondHeld.write).toHaveBeenCalledTimes(1);
+      expect(secondHeld.release).toHaveBeenCalledTimes(1);
+      expect((await getCachedPlaylist(null))?.channels).toEqual([channel('ch2')]);
+    });
+
+    it('stores the source ids a scheduled write recorded', async () => {
+      scheduleCachedPlaylist([channel('ch1')], [], Date.now(), null, playlistCacheToken(), ['p1']);
+
+      await flushCacheWrites();
+      expect((await getCachedPlaylist(null))?.sourceIds).toEqual(['p1']);
+    });
+
+    it('drops held channels whose worker write failed', async () => {
+      const channels = [channel('ch1')];
+      const held = holdInWorker(channels, () => 'failed');
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+      expect(await setCachedPlaylist(channels, [], 1000, null)).toBe(false);
+
+      expect(held.release).toHaveBeenCalledTimes(1);
+      expect(await getCachedPlaylist(null)).toBeNull();
+      warn.mockRestore();
+    });
+
+    it('asks the worker for the size of channels it left unmeasured', async () => {
+      const epg: EpgSource[] = [{ url: 'http://host/e', playlistIds: ['p1'], kind: 'm3u' }];
+      await setCachedPlaylist([channel('ch1'), channel('ch2')], epg, 1000, null);
+      const pageBytes = await entryBytes('combined-v5', 'playlist-cache');
+      const channels = [channel('ch1'), channel('ch2')];
+      const held = holdInWorker(channels, undefined, false, true);
+
+      await setCachedPlaylist(channels, epg, 1000, null);
+
+      expect(held.measure).toHaveBeenCalledTimes(1);
+      expect(held.write).toHaveBeenCalledTimes(1);
+      expect(await entryBytes('combined-v5', 'playlist-cache')).toBe(pageBytes);
+      expect((await getCacheUsage()).categories.playlist.bytes).toBe(pageBytes);
+    });
+
+    it('writes the page\'s channels when the worker lost them before measuring', async () => {
+      const channels = [channel('ch1'), channel('ch2')];
+      const held = holdInWorker(channels, undefined, false, true);
+      releaseHeldValue(held.token);
+
+      await setCachedPlaylist(channels, [], 1000, null);
+
+      expect(held.write).not.toHaveBeenCalled();
+      expect((await getCachedPlaylist(null))?.channels).toEqual(channels);
+      expect((await getCacheUsage()).categories.playlist.bytes)
+        .toBe(await entryBytes('combined-v5', 'playlist-cache'));
+    });
+
+    it('measures the page\'s own channels when the worker lost them', async () => {
+      const epg: EpgSource[] = [{ url: 'http://host/e', playlistIds: ['p1'], kind: 'm3u' }];
+      const channels = [channel('ch1'), channel('ch2')];
+      const held = holdInWorker(channels);
+      releaseHeldValue(held.token);
+      // The page renames a channel after the worker measured them.
+      Object.assign(channels[0], { name: 'Renamed channel', sourceName: channels[0].name });
+
+      await setCachedPlaylist(channels, epg, 1000, null);
+
+      const request = held.write.mock.calls[0][0];
+      expect(request.field).toBe('data.channels');
+      expect(channels).toHaveLength(2);
+      expect((await getCachedPlaylist(null))?.channels).toEqual(channels);
+      const heldBytes = await entryBytes('combined-v5', 'playlist-cache');
+      await setCachedPlaylist([...channels], epg, 1000, null);
+      expect(heldBytes).toBe(await entryBytes('combined-v5', 'playlist-cache'));
+      expect((await getCacheUsage()).categories.playlist.bytes).toBe(heldBytes);
+    });
+
+    const guide = () => ({
+      channels: { ch1: { name: 'Alpha', icon: '' } },
+      programmes: { ch1: [{
+        start: new Date(1000), stop: new Date(2000), title: 'Bravo', description: '', category: '', icon: '',
+      }] },
+    });
+
+    it('stores a guide\'s filter lists as one string and reads them back', async () => {
+      const filter = { ids: ['ch1', 'ch2'], names: ['alpha', 'bravo'], key: 'k1' };
+      await setCachedEpg('http://host/f', guide(), filter, 1000, null);
+
+      const db = await openPersistenceDb();
+      const raw = await requestResult(
+        db!.transaction('epg-cache', 'readonly').objectStore('epg-cache').get('http://host/f'),
+      ) as { filter: Record<string, unknown> };
+      expect(raw.filter).toEqual({ lists: expect.any(String), key: 'k1' });
+      const read = (await getCachedEpg('http://host/f'))!.filter!;
+      expect({ ids: read.ids, names: read.names, key: read.key }).toEqual(filter);
+    });
+
+    it('still reads a guide\'s filter stored as lists', async () => {
+      await setCachedEpg('http://host/f', guide(), null, 1000, null);
+      const db = await openPersistenceDb();
+      const tx = db!.transaction('epg-cache', 'readwrite');
+      const store = tx.objectStore('epg-cache');
+      const raw = await requestResult(store.get('http://host/f')) as Record<string, unknown>;
+      store.put({ ...raw, filter: { ids: ['ch1'], names: ['alpha'], key: 'k1' } });
+      await transactionDone(tx);
+
+      expect((await getCachedEpg('http://host/f'))?.filter)
+        .toEqual({ ids: ['ch1'], names: ['alpha'], key: 'k1' });
+    });
+
+    it('writes a held guide there, under the page\'s filter', async () => {
+      const filter = { ids: ['ch1'], names: [] };
+      await setCachedEpg('http://host/page', guide(), filter, 1000, null);
+      const data = guide();
+      const held = holdInWorker(data, undefined, false, false, packEpg(data));
+
+      await setCachedEpg('http://host/held', data, filter, 1000, null);
+
+      expect(held.write).toHaveBeenCalledTimes(1);
+      const request = held.write.mock.calls[0][0];
+      expect(request.field).toBe('data');
+      expect(request.writes[0].value).toMatchObject({ data: null, filter: packEpgFilter(filter) });
+      expect(await getCachedEpg('http://host/held')).toMatchObject({ data: guide(), filter });
+      expect(await entryBytes('http://host/held', 'epg-cache'))
+        .toBe(await entryBytes('http://host/page', 'epg-cache'));
+      expect(held.release).toHaveBeenCalledTimes(1);
+    });
+
+    it('writes the page\'s guide when the worker no longer holds it', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const data = guide();
+      const held = holdInWorker(data, undefined, false, true);
+      releaseHeldValue(held.token);
+
+      await setCachedEpg('http://host/held', data, null, 1000, null);
+
+      expect(held.measure).toHaveBeenCalledTimes(1);
+      expect(held.write).not.toHaveBeenCalled();
+      expect((await getCachedEpg('http://host/held'))?.data).toEqual(guide());
+      expect(warn.mock.calls.map(call => call.join(' ')).filter(line => line.includes('held.fallback')))
+        .toEqual([expect.stringContaining('event=persistence.cache.held.fallback stage=measure category=epg outcome=page')]);
+      warn.mockRestore();
+    });
+
+    it('packs the page\'s guide when the worker loses it during the write', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const data = guide();
+      const held = holdInWorker(data, undefined, false, false, packEpg(data));
+      releaseHeldValue(held.token);
+
+      await setCachedEpg('http://host/held', data, null, 1000, null);
+
+      expect(held.write).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls.map(call => call.join(' ')).filter(line => line.includes('held.fallback')))
+        .toEqual([expect.stringContaining('event=persistence.cache.held.fallback stage=write category=epg outcome=page')]);
+      warn.mockRestore();
+      expect((await getCachedEpg('http://host/held'))?.data).toEqual(guide());
+    });
+
+    it('writes the page copy when the worker no longer holds the list', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const items = list();
+      const held = holdInWorker(items);
+      releaseHeldValue(held.token);
+
+      await setCachedCatalog('x1|held', items, null);
+
+      expect(held.write).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls.map(call => call.join(' ')).filter(line => line.includes('held.fallback')))
+        .toEqual([expect.stringContaining('event=persistence.cache.held.fallback stage=write category=catalog outcome=page')]);
+      warn.mockRestore();
+      expect((await getCachedCatalog('x1|held'))?.data).toEqual(list());
+      expect((await getCacheUsage()).categories.catalog.entries).toBe(1);
+    });
+
+    it('skips a list only the worker had once it is gone before its size is known', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const lost: never[] = [];
+      const held = holdInWorker(lost, undefined, true, true);
+      releaseHeldValue(held.token);
+
+      expect(await setCachedCatalog('x1|lost', lost, null)).toBeNull();
+
+      expect(held.write).not.toHaveBeenCalled();
+      expect(warn.mock.calls.map(call => call.join(' ')).filter(line => line.includes('held.fallback')))
+        .toEqual([expect.stringContaining('stage=measure category=catalog outcome=skipped')]);
+      warn.mockRestore();
+    });
+
+    it('never stores an empty stand-in for a list only the worker had', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const lost: never[] = [];
+      const held = holdInWorker(lost, undefined, true);
+      releaseHeldValue(held.token);
+      expect(await setCachedCatalog('x1|lost', lost, null)).toBeNull();
+      expect(await getCachedCatalog('x1|lost')).toBeNull();
+
+      const stand: never[] = [];
+      holdInWorker(stand, undefined, true);
+      const first = await setCachedCatalog('x1|stand', stand, null);
+      expect(first).toEqual(expect.any(Number));
+      // The worker's list is written, so the stand-in has nothing left to store.
+      expect(await setCachedCatalog('x1|stand', stand, null)).toBeNull();
+      expect((await getCachedCatalog('x1|stand'))?.timestamp).toBe(first);
+      warn.mockRestore();
+    });
+
+    it('prunes and retries when the worker write runs out of quota', async () => {
+      const items = list();
+      let answers = 0;
+      const held = holdInWorker(items, () => (answers++ ? null : 'quota_exceeded'));
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+      await setCachedCatalog('x1|held', items, null);
+
+      expect(held.write).toHaveBeenCalledTimes(2);
+      expect((await getCachedCatalog('x1|held'))?.data).toEqual(list());
+      expect(warn.mock.calls.some(call => call.join(' ').includes('event=persistence.cache.quota.exceeded'))).toBe(true);
+      warn.mockRestore();
+    });
+
+    it('retries its own copy after a quota error without asking the worker again', async () => {
+      const channels = [channel('ch1'), channel('ch2')];
+      const held = holdInWorker(channels);
+      releaseHeldValue(held.token);
+      const put = IDBObjectStore.prototype.put;
+      let failed = false;
+      const spy = vi.spyOn(IDBObjectStore.prototype, 'put').mockImplementation(function (
+        this: IDBObjectStore,
+        ...args: Parameters<IDBObjectStore['put']>
+      ) {
+        if (this.name === 'playlist-cache' && !failed) {
+          failed = true;
+          throw new DOMException('full', 'QuotaExceededError');
+        }
+        return put.apply(this, args);
+      });
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+      await setCachedPlaylist(channels, [], 1000, null);
+      spy.mockRestore();
+      warn.mockRestore();
+
+      expect(failed).toBe(true);
+      expect(held.write).toHaveBeenCalledTimes(1);
+      expect((await getCachedPlaylist(null))?.channels).toEqual(channels);
+    });
+
+    it('stores nothing when the worker write fails', async () => {
+      const items = list();
+      holdInWorker(items, () => 'failed');
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+      await setCachedCatalog('x1|held', items, null);
+
+      expect(await getCachedCatalog('x1|held')).toBeNull();
+      expect((await getCacheUsage()).categories.catalog).toEqual({ bytes: 0, entries: 0 });
+      warn.mockRestore();
+    });
+  });
+
+  it('touches access metadata without rewriting a cached payload', async () => {
+    await setCachedCatalog('x1|vod_all', Array.from({ length: 100 }, (_, index) => index));
+    const db = await openPersistenceDb();
+    expect(db).not.toBeNull();
+    const beforeTx = db!.transaction(CATALOG_STORE, 'readonly');
+    const before = await requestResult(beforeTx.objectStore(CATALOG_STORE).get('x1|vod_all'));
+
+    expect(await getCachedCatalog('x1|vod_all')).not.toBeNull();
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    const afterTx = db!.transaction([CATALOG_STORE, CACHE_META_STORE], 'readonly');
+    const after = await requestResult(afterTx.objectStore(CATALOG_STORE).get('x1|vod_all'));
+    const access = await requestResult(
+      afterTx.objectStore(CACHE_META_STORE).get('entry:catalog-cache:x1|vod_all'),
+    );
+    expect(after).toEqual(before);
+    expect(access).toMatchObject({
+      store: CATALOG_STORE,
+      key: 'x1|vod_all',
+    });
+  });
+
+  it('counts a catalog metadata read as a use of the catalog', async () => {
+    const key = 'x1|metadata_touch';
+    await setCachedCatalog(key, [{ name: 'Alpha' }]);
+    const db = (await openPersistenceDb())!;
+    const metaId = `entry:catalog-cache:${key}`;
+    const stale = db.transaction(CACHE_META_STORE, 'readwrite');
+    const meta = await requestResult(stale.objectStore(CACHE_META_STORE).get(metaId)) as { lastAccessedAt: number };
+    await requestResult(stale.objectStore(CACHE_META_STORE).put({ ...meta, lastAccessedAt: 1 }));
+
+    expect(await getCachedCatalogMetadata(key)).not.toBeNull();
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    const after = await requestResult(
+      db.transaction(CACHE_META_STORE, 'readonly').objectStore(CACHE_META_STORE).get(metaId),
+    ) as { lastAccessedAt: number };
+    expect(after.lastAccessedAt).toBeGreaterThan(1);
+  });
+
+  it('keeps accounting correct when pruning the record being updated', async () => {
+    await setCachedSubtitle('subdl:4', 'WEBVTT\n\nold');
+    await withQuota(100, 0, async () => {
+      await setCachedSubtitle('subdl:4', 'WEBVTT\n\nreplacement');
+    });
+
+    const usage = await getCacheUsage();
+    expect(usage.categories.subtitle.entries).toBe(1);
+    expect(usage.total.entries).toBe(1);
+  });
+
+  describe('search index records', () => {
+    const MiB = 1024 * 1024;
+    const candidate = (key: string, bytes: number, timestamp = 1) => ({
+      key: `catalog-cache|${key}|${String(timestamp)}|v1`,
+      prefix: `catalog-cache|${key}|`,
+      bytes,
+    });
+
+    async function seedSource(key: string, timestamp = 1): Promise<void> {
+      const now = vi.spyOn(Date, 'now').mockReturnValue(timestamp);
+      try {
+        await setCachedCatalog(key, [key], null);
+      } finally {
+        now.mockRestore();
+      }
+    }
+
+    let sourceBytes = 0;
+    beforeEach(async () => {
+      await seedSource('x1|vod_all');
+      await seedSource('x1|series_all');
+      sourceBytes = (await getCacheUsage()).total.bytes;
+    });
+
+    async function writeIndex(key: string, extra: object = {}): Promise<void> {
+      const db = (await openPersistenceDb())!;
+      const tx = db.transaction(SEARCH_INDEX_STORE, 'readwrite');
+      tx.objectStore(SEARCH_INDEX_STORE).put({ key, text: 'alpha', ...extra });
+      await transactionDone(tx);
+    }
+
+    async function storedIndexKeys(): Promise<string[]> {
+      const db = (await openPersistenceDb())!;
+      const tx = db.transaction(SEARCH_INDEX_STORE, 'readonly');
+      return await requestResult(tx.objectStore(SEARCH_INDEX_STORE).getAllKeys()) as string[];
+    }
+
+    it('accounts for a reserved index in its own category', async () => {
+      const reservation = await reserveSearchIndex(candidate('x1|vod_all', MiB));
+      expect(reservation?.fields).toMatchObject({ cacheCategory: 'search', byteSize: MiB });
+      await writeIndex(candidate('x1|vod_all', MiB).key, reservation!.fields);
+      await settleSearchIndex(candidate('x1|vod_all', MiB).key, reservation!, true);
+
+      const usage = await getCacheUsage();
+      expect(usage.categories.search).toEqual({ bytes: MiB, entries: 1 });
+      expect(usage.total).toEqual({ bytes: sourceBytes + MiB, entries: 3 });
+      expect(await storedIndexKeys()).toEqual([candidate('x1|vod_all', MiB).key]);
+    });
+
+    it('skips an index larger than its share of the room left', async () => {
+      // The 384 MiB budget: 10% is 38.4 MiB.
+      const info = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+      expect(await reserveSearchIndex(candidate('x1|vod_all', 39 * MiB))).toBeNull();
+      expect(info.mock.calls.map(call => call.join(' '))).toContainEqual(expect.stringContaining(
+        `event=search.index.persist.skipped reason=budget bytes=${String(39 * MiB)} roomBytes=${String(384 * MiB - sourceBytes)}`,
+      ));
+      info.mockRestore();
+      expect(await reserveSearchIndex(candidate('x1|vod_all', 38 * MiB))).not.toBeNull();
+      // Reserved bytes shrink the room for the next index.
+      expect(await reserveSearchIndex(candidate('x1|series_all', 35 * MiB))).toBeNull();
+      expect((await getCacheUsage()).categories.search.entries).toBe(1);
+    });
+
+    it('measures the room against the origin quota as well', async () => {
+      await withQuota(100 * MiB, 75 * MiB, async () => {
+        // 80% of quota leaves 5 MiB; 10% of that is 0.5 MiB.
+        expect(await reserveSearchIndex(candidate('x1|vod_all', MiB))).toBeNull();
+        expect(await reserveSearchIndex(candidate('x1|vod_all', MiB / 4))).not.toBeNull();
+      });
+    });
+
+    it('replaces the older index of the same source', async () => {
+      const old = candidate('x1|vod_all', MiB);
+      const reservation = await reserveSearchIndex(old);
+      expect(reservation?.evicted).toBe(0);
+      await writeIndex(old.key, reservation!.fields);
+      await writeIndex('catalog-cache|x1|vod_all|untracked|v1');
+      await writeIndex('catalog-cache|x1|series_all|0|v1');
+      await seedSource('x1|vod_all', 2);
+
+      expect((await reserveSearchIndex(candidate('x1|vod_all', 2 * MiB, 2)))?.evicted).toBe(1);
+
+      // The older index is gone even when the new one does not fit.
+      const info = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+      expect(await reserveSearchIndex(candidate('x1|vod_all', 39 * MiB, 2))).toBeNull();
+      expect(info.mock.calls.map(call => call.join(' '))).toContainEqual(expect.stringMatching(
+        /event=search\.index\.persist\.skipped reason=budget bytes=\d+ roomBytes=\d+ evicted=1$/,
+      ));
+      info.mockRestore();
+      expect(await storedIndexKeys()).toEqual(['catalog-cache|x1|series_all|0|v1']);
+      expect((await getCacheUsage()).categories.search).toEqual({ bytes: 0, entries: 0 });
+    });
+
+    it('evicts index records before any source data', async () => {
+      const reservation = await reserveSearchIndex(candidate('x1|vod_all', 8 * MiB));
+      await writeIndex(candidate('x1|vod_all', 0).key, reservation!.fields);
+      await setCachedStreamMime('http://host/live', 'video/mp2t');
+      await setCachedSubtitle('subdl:1', 'WEBVTT\n\nkept');
+      const used = (await getCacheUsage()).total.bytes;
+
+      // A budget (half the quota) that fits everything but the index, with
+      // room for the pruning margin.
+      await withQuota(2 * (used - 2 * MiB), 0, async () => {
+        await setCachedCatalog('x1|vod_categories', ['a']);
+      });
+
+      expect(await storedIndexKeys()).toEqual([]);
+      expect((await getCacheUsage()).categories.search.entries).toBe(0);
+      expect(await getCachedSubtitle('subdl:1')).toBe('WEBVTT\n\nkept');
+      expect(await getCachedCatalog('x1|vod_categories')).not.toBeNull();
+    });
+
+    it('gives the room back when the write failed', async () => {
+      const reservation = await reserveSearchIndex(candidate('x1|vod_all', MiB));
+      await settleSearchIndex(candidate('x1|vod_all', MiB).key, reservation!, false);
+      expect((await getCacheUsage()).categories.search).toEqual({ bytes: 0, entries: 0 });
+    });
+
+    it('removes an index whose write raced a cache clear', async () => {
+      const reservation = await reserveSearchIndex(candidate('x1|vod_all', MiB));
+      await clearAllCachedData();
+      await writeIndex(candidate('x1|vod_all', MiB).key, reservation!.fields);
+      await settleSearchIndex(candidate('x1|vod_all', MiB).key, reservation!, true);
+
+      expect(await storedIndexKeys()).toEqual([]);
+      expect((await getCacheUsage()).categories.search).toEqual({ bytes: 0, entries: 0 });
+    });
+
+    it('reserves nothing once a clear started after the request', async () => {
+      const pending = reserveSearchIndex(candidate('x1|vod_all', MiB));
+      const cleared = clearAllCachedData();
+      // The reservation was queued first, so it lands before the clear wipes it.
+      await pending;
+      await cleared;
+      expect((await getCacheUsage()).categories.search.entries).toBe(0);
+      expect(await storedIndexKeys()).toEqual([]);
+    });
+
+    it('goes with its source store when that store is cleared', async () => {
+      await setCachedEpg('http://host/e', { channels: {}, programmes: {} } as never, null, 1, null);
+      const epg = {
+        key: 'epg-cache|http://host/e|1|v1',
+        prefix: 'epg-cache|http://host/e|',
+        bytes: 2 * MiB,
+      };
+      for (const entry of [candidate('x1|vod_all', MiB), candidate('x1|series_all', MiB), epg]) {
+        const reservation = await reserveSearchIndex(entry);
+        await writeIndex(entry.key, reservation!.fields);
+        await settleSearchIndex(entry.key, reservation!, true);
+      }
+
+      await clearCachedCatalog();
+      expect(await storedIndexKeys()).toEqual([epg.key]);
+      let usage = await getCacheUsage();
+      expect(usage.categories.search).toEqual({ bytes: 2 * MiB, entries: 1 });
+      expect(usage.categories.catalog.entries).toBe(0);
+      expect(usage.total.entries).toBe(2);
+
+      await clearCachedEpg();
+      expect(await storedIndexKeys()).toEqual([]);
+      usage = await getCacheUsage();
+      expect(usage.categories.search).toEqual({ bytes: 0, entries: 0 });
+      expect(usage.total).toEqual({ bytes: 0, entries: 0 });
+    });
+
+    it('removes an index whose write raced a clear of its source', async () => {
+      const reservation = await reserveSearchIndex(candidate('x1|vod_all', MiB));
+      await clearCachedCatalog();
+      await writeIndex(candidate('x1|vod_all', MiB).key, reservation!.fields);
+      await settleSearchIndex(candidate('x1|vod_all', MiB).key, reservation!, true);
+
+      expect(await storedIndexKeys()).toEqual([]);
+      expect((await getCacheUsage()).categories.search).toEqual({ bytes: 0, entries: 0 });
+    });
+
+    it('skips an index built from a record that was cleared or replaced', async () => {
+      const info = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+      await seedSource('x1|vod_all', 2);
+      expect(await reserveSearchIndex(candidate('x1|vod_all', MiB, 1))).toBeNull();
+      await clearCachedCatalog();
+      expect(await reserveSearchIndex(candidate('x1|series_all', MiB))).toBeNull();
+      expect(info.mock.calls.map(call => call.join(' ')).filter(line =>
+        line.includes('event=search.index.persist.skipped '))).toEqual([
+        expect.stringMatching(/reason=source_changed bytes=\d+$/),
+        expect.stringMatching(/reason=source_changed bytes=\d+$/),
+      ]);
+      info.mockRestore();
+      expect((await getCacheUsage()).categories.search.entries).toBe(0);
+    });
+
+    it('is emptied by a full cache clear', async () => {
+      const reservation = await reserveSearchIndex(candidate('x1|vod_all', MiB));
+      await writeIndex(candidate('x1|vod_all', MiB).key, reservation!.fields);
+      await clearAllCachedData();
+      expect(await storedIndexKeys()).toEqual([]);
+    });
+
+    it('notifies listeners once a scheduled playlist write lands', async () => {
+      const listener = vi.fn();
+      const stop = onPlaylistCacheWritten(listener);
+      try {
+        await setCachedPlaylist([channel('ch1')], [], Date.now(), null);
+        expect(listener).not.toHaveBeenCalled();
+        vi.useFakeTimers();
+        scheduleCachedPlaylist([channel('ch1')], [], Date.now(), null, playlistCacheToken());
+        await vi.runAllTimersAsync();
+        vi.useRealTimers();
+        await flushCacheWrites();
+        await vi.waitFor(() => expect(listener).toHaveBeenCalledTimes(1));
+      } finally {
+        vi.useRealTimers();
+        stop();
+      }
+    });
+  });
+});

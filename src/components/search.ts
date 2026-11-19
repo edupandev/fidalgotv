@@ -1,0 +1,2151 @@
+import type { Action, CatchupInfo, Channel, PlaylistEntry, Programme, VodItem, SeriesItem } from '../types';
+import { SpatialNav, isFocusMove } from '../navigation/spatial-nav';
+import { Focus, type FocusScope } from '../navigation/focus-scope';
+import { html, raw } from '../utils/dom';
+import { channelLockBadge, seriesLockBadge, vodLockBadge } from './parental-badge';
+import { morph } from '../utils/morph';
+import { PlaylistService } from '../services/playlist-service';
+import { EpgService } from '../services/epg-service';
+import { ReminderService } from '../services/reminder-service';
+import { StorageService } from '../services/storage-service';
+import { XtreamArchiveService } from '../services/xtream-archive';
+import { catchupNeedsId, hasCatchup } from '../utils/catchup-url';
+import { persistSearchIndexes } from '../services/search-index-store';
+import {
+  getSearchCatalogExpiresAt,
+  loadAllSeries,
+  loadAllVodStreams,
+  onCatalogListRefreshed,
+  syncAllSeries,
+  syncAllVodStreams,
+} from '../services/xtream-catalog';
+import { sameCatalogConcealment } from '../utils/catalog-concealment';
+import {
+  prepareNameSearchItems,
+  prepareSearchItems,
+  rankPreparedNamesTopK,
+  rankPreparedTopK,
+} from '../utils/channel-search';
+import { channelKey } from '../utils/channel';
+import { formatDayLabel, formatTime } from '../utils/time';
+import { showToast } from './toast';
+import { CatchupResumePrompt } from './catchup-resume-prompt';
+import { CONFIG } from '../config';
+import { createLogger } from '../utils/logger';
+import { t } from '../i18n';
+import { VirtualList } from '../utils/virtual-list';
+import { VirtualScrollGuard, type VirtualScrollAxis } from '../utils/virtual-scroll';
+import { runInFrameSlices } from '../utils/frame-slices';
+import {
+  appWorkerGeneration,
+  retainAppWorker,
+  runAppWorkerTask,
+} from '../workers/app-worker-client';
+import {
+  catalogParentalRequest,
+  isSeriesConcealed,
+  isVodConcealed,
+  liveParentalRequest,
+  ParentalControlService,
+} from '../services/parental-control';
+import type {
+  SearchCachedNames,
+  SearchCacheRecord,
+  SearchCatalogRecord,
+  SearchIndexChunk,
+  SearchIndexRequest,
+  SearchIndexSource,
+  SearchQueryRequest,
+  SearchQueryResponse,
+} from '../workers/tasks';
+import {
+  cachedChannelsRequest,
+  cachedNamesRequest,
+  channelDocument,
+  ProgrammeRuns,
+  sampleDocuments,
+  selectCatalogItems,
+} from './search-cache-source';
+
+const log = createLogger('Search');
+const SEARCH_LIST_VIEWPORT = 420;
+const SEARCH_RAIL_VIEWPORT = 1760;
+const SEARCH_ROW_OVERSCAN = 6;
+const SEARCH_RAIL_OVERSCAN = 4;
+
+export interface SearchHandlers {
+  onRevealTabBar: () => void;
+  // A result arrived after the remote waited in the box: let it go.
+  onReleaseTabBar: () => void;
+  onBack: () => void;
+  onPlayChannel: (index: number, catchup?: CatchupInfo) => void;
+  onOpenMovie: (account: PlaylistEntry, vod: VodItem) => void;
+  onOpenSeries: (account: PlaylistEntry, series: SeriesItem) => void;
+}
+
+interface ProgramResult {
+  channel: Channel;
+  channelIndex: number;
+  programme: Programme;
+}
+
+function programDocument(result: ProgramResult): string[] {
+  return [
+    result.programme.title,
+    result.programme.category,
+    result.programme.description,
+    result.channel.name,
+    result.channel.group,
+  ];
+}
+
+type CatalogLoadResult<T> =
+  | { ok: true; data: T }
+  | { ok: false; error: unknown };
+
+interface CatalogSources {
+  movies: boolean;
+  series: boolean;
+}
+
+// Sources still on their way to the worker in this session.
+interface PendingIndex {
+  channels: boolean;
+  programmes: boolean;
+  catalog: boolean;
+}
+
+interface SourcePost {
+  id: number;
+  // Settles once this post stops sending chunks.
+  sent: Promise<void>;
+  result: Promise<boolean>;
+}
+
+function nextFrame(): Promise<void> {
+  return new Promise(resolve => requestAnimationFrame(() => resolve()));
+}
+
+function captureCatalogLoad<T>(promise: Promise<T>): Promise<CatalogLoadResult<T>> {
+  return promise.then(
+    (data) => ({ ok: true, data }),
+    (error: unknown) => ({ ok: false, error }),
+  );
+}
+
+// A catalog the worker holds as a record: an empty list stands in for it, so
+// identity checks still see a change, and answers carry the ranked items.
+const recordLists = new WeakSet<unknown[]>();
+
+function recordList<T>(): T[] {
+  const list: T[] = [];
+  recordLists.add(list);
+  return list;
+}
+
+function isRecordList(list: unknown[]): boolean {
+  return recordLists.has(list);
+}
+
+function sameCatalogRecord(left: SearchCatalogRecord | null, right: SearchCatalogRecord): boolean {
+  return !!left && left.record.store === right.record.store && left.record.key === right.record.key
+    && left.record.timestamp === right.record.timestamp
+    && sameCatalogConcealment(left.concealment, right.concealment);
+}
+
+type CatalogSourceLoad<T> = { record: SearchCacheRecord; data: null } | { record: null; data: T[] };
+
+// The synced record when the worker can hold the catalog, else the list.
+async function loadCatalogSource<T>(
+  account: PlaylistEntry,
+  signal: AbortSignal,
+  sync: (account: PlaylistEntry, signal: AbortSignal) => Promise<SearchCacheRecord | null>,
+  load: (account: PlaylistEntry, signal: AbortSignal) => Promise<T[]>,
+): Promise<CatalogSourceLoad<T>> {
+  const record = await sync(account, signal);
+  return record ? { record, data: null } : { record: null, data: await load(account, signal) };
+}
+
+// Record items the worker sent this epoch, by catalog index.
+interface DeliveredItems {
+  epoch: number;
+  movies: Map<number, VodItem>;
+  series: Map<number, SeriesItem>;
+}
+
+function deliveredItems(epoch: number): DeliveredItems {
+  return { epoch, movies: new Map(), series: new Map() };
+}
+
+type RecordFallback = Array<{ name: string }> | 'synced' | 'replaced' | null;
+
+function sameCacheRef(left: SearchCacheRecord, right: SearchCacheRecord): boolean {
+  return left.store === right.store && left.key === right.key && left.timestamp === right.timestamp;
+}
+
+function sameCatalogSource(left: SearchCachedNames | null, right: SearchCachedNames | null): boolean {
+  if (!left || !right || left.record.key !== right.record.key
+    || left.record.timestamp !== right.record.timestamp || left.length !== right.length) return false;
+  if (!left.selection || !right.selection) return left.selection === right.selection;
+  if (left.selection.length !== right.selection.length) return false;
+  for (let i = 0; i < left.selection.length; i++) {
+    if (left.selection[i] !== right.selection[i]) return false;
+  }
+  return true;
+}
+
+// The Search section: one query box over Channels / Programs / Movies / Series.
+// Results are relevance-ranked and capped; movies and series match the account's
+// full catalogs, loaded once on open and cached.
+// Up from the box reveals the tab bar; Back returns to Live. The global key
+// handler ignores INPUT keydowns, so the box owns its own text input + focus-out
+// keys.
+export class Search {
+  private nav: SpatialNav;
+  readonly focusScope: FocusScope;
+  private account: PlaylistEntry | null = null;
+  private query = '';
+  private allVod: VodItem[] = [];
+  private allSeries: SeriesItem[] = [];
+  private programIndex: ProgramResult[] = [];
+  private programRuns = new ProgrammeRuns();
+  // The catalog-cache selections behind allVod / allSeries, when available.
+  private vodCache: SearchCachedNames | null = null;
+  private seriesCache: SearchCachedNames | null = null;
+  // The catalog records the worker holds for allVod / allSeries in record mode.
+  private vodRecord: SearchCatalogRecord | null = null;
+  private seriesRecord: SearchCatalogRecord | null = null;
+  private delivered = deliveredItems(-1);
+  // The worker generation that sent the delivered items.
+  private deliveredWorker: number | null = null;
+  // The query whose catalog results are shown; only the worker ranks a record.
+  private catalogQuery: string | null = null;
+  // The channel list whose documents the worker holds in this session.
+  private workerChannels: Channel[] | null = null;
+  private indexedChannels: Channel[] | null = null;
+  private indexedGuideRevision: number | null = null;
+  private loadedFor: string | null = null;
+  private catalogExpiresAt = 0;
+  private visibleChannels: Channel[] = [];
+  private visiblePrograms: ProgramResult[] = [];
+  private visibleMovies: VodItem[] = [];
+  private visibleSeries: SeriesItem[] = [];
+  private resumePrompt = new CatchupResumePrompt('prompt.search');
+  private readonly programVirtualizer = this.createVirtualizer(109, SEARCH_ROW_OVERSCAN, SEARCH_LIST_VIEWPORT);
+  private readonly channelRailVirtualizer = this.createVirtualizer(240, SEARCH_RAIL_OVERSCAN, SEARCH_RAIL_VIEWPORT);
+  private readonly movieVirtualizer = this.createVirtualizer(240, SEARCH_RAIL_OVERSCAN, SEARCH_RAIL_VIEWPORT);
+  private readonly seriesVirtualizer = this.createVirtualizer(240, SEARCH_RAIL_OVERSCAN, SEARCH_RAIL_VIEWPORT);
+  private scrollFrame: number | null = null;
+  // The window each virtual rail last rendered; its cells sit at fixed
+  // offsets, so a scroll inside the window needs no render.
+  private readonly railWindows = new Map<string, string>();
+  private queryFrame: number | null = null;
+  private queryGeneration = 0;
+  private queryPending = false;
+  // Down/Enter handed focus over before the results existed; focus them once a query renders.
+  private focusPending = false;
+  private focusWaitingInBox = false;
+  private catalogController: AbortController | null = null;
+  // The load that stands in for a catalog record the worker could not read.
+  private recordFallback: AbortController | null = null;
+  // The session that already synced each record again after a failed read.
+  private readonly resynced = { movies: -1, series: -1 };
+  // A second caller in the same session shares the first one's fallback.
+  private readonly fallbacks: {
+    movies?: { sessionId: number; result: Promise<RecordFallback> };
+    series?: { sessionId: number; result: Promise<RecordFallback> };
+  } = {};
+  // Shared by a reopen, so closing Search does not restart the load.
+  private catalogLoad: { accountId: string; promise: Promise<CatalogSources> } | null = null;
+  private catalogLoading = false;
+  // The generation of the full query that replaces partial results, while in flight.
+  private completingPartial: number | null = null;
+  // A playlist load is running; refreshChannels() ends it once the load is done.
+  private channelLoad = false;
+  // Until every source is indexed, queries wait and the results show a hint.
+  private pendingIndex: PendingIndex | null = null;
+  // The worker's channels are empty until a channels-only repost lands.
+  private channelRepost: { sessionId: number; done: Promise<void> } | null = null;
+  private active = false;
+  private programIndexGeneration = 0;
+  private workerSession = 0;
+  private workerIndexReady = false;
+  // A post failed, so the worker may hold a partial index; the next query rebuilds it.
+  private workerIndexLost = false;
+  // Sources that settled without an index: answers leave them out until the rebuild.
+  private lostSources: Partial<Record<keyof PendingIndex, true>> | null = null;
+  // One rebuild of a lost index per session; queries meanwhile wait for it.
+  private recovery: { sessionId: number; done: Promise<boolean> } | null = null;
+  // A rebuild of the session's lost index failed: until `at`, its queries rank
+  // on the main thread rather than post the whole index to that worker again.
+  // `logged`: the failure was logged, and is not again until a rebuild succeeds.
+  private recoveryRetry: {
+    sessionId: number;
+    at: number;
+    generation: number | null;
+    logged: boolean;
+  } | null = null;
+  // The catalog lists the worker ranks, which can trail allVod/allSeries
+  // while a refresh is posted; worker indices map onto these.
+  private indexedVod: VodItem[] = [];
+  private indexedSeries: SeriesItem[] = [];
+  // How this session's index reached the worker, for its diagnostic event.
+  private indexStats = { startedAt: 0, hintAt: 0, persisted: 0, built: 0, posted: 0 };
+  // The latest chunked post of each source; a source posts one sequence at a time.
+  private sourcePosts: Partial<Record<SearchIndexSource, SourcePost>> = {};
+  private sourcePostId = 0;
+  private workerIndexedChannels: Channel[] | null = null;
+  // Whether the posted channels were the whole list: a running load grows it
+  // in place, so the same array may hold more by now.
+  private workerChannelsComplete = false;
+  private workerIndexedChannelsComplete = false;
+  private workerIndexedGuideRevision: number | null = null;
+  private workerIndexedAccountId: string | null = null;
+  private workerIndexedGeneration: number | null = null;
+  private workerResetGeneration: number | null = null;
+  private workerIndexedVod: VodItem[] | null = null;
+  private workerIndexedSeries: SeriesItem[] | null = null;
+  private releaseWorker: (() => void) | null = null;
+  private readonly scrollGuard = new VirtualScrollGuard();
+
+  constructor(private container: HTMLElement, private handlers: SearchHandlers) {
+    this.focusScope = Focus.register({
+      id: 'view.search',
+      root: container,
+      leaveFor: { up: 'tabbar' },
+      defaultKey: () => this.navKey(),
+      resolve: (key) => this.resolveKey(key),
+    });
+    this.nav = new SpatialNav(container, undefined, { scope: this.focusScope });
+    // Activate the result under the pointer by coordinate hit-test, so it lands
+    // here regardless of D-pad focus; the container is marked `data-self-activate`
+    // so the global click handler skips this subtree and doesn't double-fire.
+    this.container.setAttribute('data-self-activate', '');
+    this.container.addEventListener('click', (e: MouseEvent) => this.onPointerRelease(e.clientX, e.clientY));
+    this.container.addEventListener('scroll', (e: Event) => this.onVirtualScroll(e), true);
+    onCatalogListRefreshed((key, changed) => this.onCatalogRefreshed(key, changed));
+  }
+
+  private onPointerRelease(x: number, y: number): void {
+    const el = document.elementFromPoint(x, y)?.closest<HTMLElement>('[data-focusable]');
+    if (!el || !this.container.contains(el)) return;
+    this.nav.focus(el, 'pointer');
+    this.onSelect();
+  }
+
+  private navKey(): string | null {
+    const el = this.nav.focused;
+    return el && this.container.contains(el) ? el.dataset.key ?? null : null;
+  }
+
+  // A channel can show as both a tile and a row: the ring goes on the one
+  // the nav holds.
+  private resolveKey(key: string): HTMLElement | null {
+    const el = this.nav.focused;
+    if (el && this.container.contains(el) && el.dataset.key === key) return el;
+    return Array.from(this.container.querySelectorAll<HTMLElement>('[data-focusable][data-key]'))
+      .find((item) => item.dataset.key === key) ?? null;
+  }
+
+  async open(account: PlaylistEntry | null, query = ''): Promise<void> {
+    this.active = true;
+    // Another task may have started a new, empty worker since the index was built.
+    const generation = appWorkerGeneration();
+    if (generation === null || generation !== this.workerIndexedGeneration) {
+      this.invalidateWorkerIndex();
+    }
+    const reuseWorkerIndex = this.canReuseWorkerIndex(account);
+    if (!this.releaseWorker) this.releaseWorker = retainAppWorker();
+    this.cancelScheduledQuery();
+    if (this.catalogLoad && this.catalogLoad.accountId !== account?.id) this.abortCatalogLoad();
+    if (this.loadedFor !== account?.id) {
+      this.allVod = [];
+      this.allSeries = [];
+      this.vodCache = null;
+      this.seriesCache = null;
+      this.vodRecord = null;
+      this.seriesRecord = null;
+      this.loadedFor = null;
+      this.catalogExpiresAt = 0;
+    }
+    this.account = account;
+    this.query = query;
+    if (!reuseWorkerIndex) {
+      this.pendingIndex = { channels: true, programmes: true, catalog: !!account };
+      this.clearResults();
+    }
+    this.render();
+    if (reuseWorkerIndex) {
+      this.logIndexReady('reused');
+      if (account && Date.now() >= this.catalogExpiresAt) this.refreshCatalogIndex(account);
+      return;
+    }
+
+    const sessionId = ++this.workerSession;
+    this.invalidateWorkerIndex();
+    this.workerIndexLost = false;
+    this.lostSources = null;
+    this.completingPartial = null;
+    this.recoveryRetry = null;
+    const now = Date.now();
+    this.indexStats = { startedAt: now, hintAt: query.trim() ? now : 0, persisted: 0, built: 0, posted: 0 };
+    this.workerChannels = null;
+    const workerReset = new Promise<boolean>((resolve, reject) => {
+      requestAnimationFrame(() => {
+        if (!this.active || sessionId !== this.workerSession) {
+          resolve(false);
+          return;
+        }
+        this.indexWorker({ sessionId, reset: true }).then(resolve, reject);
+      });
+    });
+    const primary = this.indexChannelsAndProgrammes(sessionId, workerReset).catch((error: unknown) => {
+      if (sessionId !== this.workerSession) return;
+      // Queries rebuild a lost index themselves; don't leave the hint up.
+      log.error('Search index build failed', 'event=search.worker.index.failed', error);
+      this.indexLost(sessionId, 'error', 'channels', 'programmes');
+    });
+    if (account) {
+      this.catalogLoading = true;
+      // A landing catalog holds the UI thread for seconds, so channels and
+      // programs get indexed, and answer, first.
+      const catalogIndexed = primary.then(() => {
+        if (sessionId !== this.workerSession) return false;
+        return this.loadCatalog(account).then(async (sources) => {
+          if (!await workerReset || sessionId !== this.workerSession) return false;
+          return this.indexCatalog(sessionId, sources.movies, sources.series);
+        });
+      });
+      const settled = (indexed: boolean): void => {
+        if (sessionId !== this.workerSession) return;
+        this.catalogLoading = false;
+        if (indexed) this.indexSettled(sessionId, 'catalog');
+        else this.indexLost(sessionId, 'rejected', 'catalog');
+        this.applyPendingFocus();
+      };
+      catalogIndexed.then(settled, () => {
+        if (sessionId !== this.workerSession) return;
+        this.catalogLoading = false;
+        this.indexLost(sessionId, 'error', 'catalog');
+        this.applyPendingFocus();
+      });
+    }
+    await primary;
+  }
+
+  private async indexChannelsAndProgrammes(
+    sessionId: number,
+    workerReset: Promise<boolean>,
+  ): Promise<void> {
+    const reset = await workerReset;
+    if (!reset || !this.active || sessionId !== this.workerSession) return;
+    const channels = PlaylistService.channels;
+    const complete = PlaylistService.complete;
+    const postChannels = (): Promise<boolean> => this.postSource(
+      sessionId,
+      'channels',
+      channels.length,
+      index => channelDocument(channels[index]),
+    );
+    const cachedChannels = cachedChannelsRequest(channels, PlaylistService.getChannelCacheSource());
+    const channelsIndexed = cachedChannels
+      ? await this.indexWorkerFromCache({ sessionId, cachedChannels }, postChannels)
+      : await postChannels();
+    if (!channelsIndexed) {
+      this.indexLost(sessionId, 'rejected', 'channels', 'programmes');
+      return;
+    }
+    if (!this.active || sessionId !== this.workerSession) return;
+    this.workerChannels = channels;
+    this.workerChannelsComplete = complete;
+    this.indexSettled(sessionId, 'channels');
+    this.programIndexDone(sessionId, await this.buildProgramIndex(false, sessionId));
+  }
+
+  /** The tab bar's search box drives the query; re-render the results for it. */
+  async setQuery(query: string): Promise<void> {
+    this.focusPending = false;
+    this.cancelScheduledQuery();
+    this.query = query;
+    if (!query.trim()) {
+      this.clearResults();
+      this.render();
+      return;
+    }
+    await this.startQuery(this.queryGeneration);
+  }
+
+  scheduleQuery(query: string): void {
+    this.focusPending = false;
+    this.query = query;
+    const generation = ++this.queryGeneration;
+    if (this.queryFrame !== null) cancelAnimationFrame(this.queryFrame);
+    if (!query.trim()) {
+      this.queryFrame = null;
+      this.clearResults();
+      this.render();
+      return;
+    }
+    this.queryFrame = requestAnimationFrame(() => {
+      this.queryFrame = null;
+      if (generation !== this.queryGeneration) return;
+      void this.startQuery(generation);
+    });
+  }
+
+  async refreshPrograms(): Promise<void> {
+    this.programIndexGeneration++;
+    this.indexedChannels = null;
+    this.indexedGuideRevision = null;
+    if (!this.active) return;
+    const sessionId = this.workerSession;
+    // While sources are pending, the last one to settle runs the query.
+    const wasPending = !!this.pendingIndex;
+    try {
+      this.programIndexDone(sessionId, await this.buildProgramIndex(true, sessionId));
+    } catch (error) {
+      log.error('Search program index failed', 'event=search.worker.index.failed', 'scope=programmes', error);
+      this.indexLost(sessionId, 'error', 'programmes');
+    }
+    if (!wasPending && this.active && !this.pendingIndex && this.query.trim()) {
+      await this.startQuery(++this.queryGeneration);
+    }
+  }
+
+  beginChannelLoad(): void {
+    this.channelLoad = true;
+  }
+
+  // Indexes the channels a load finished while Search was open. The results
+  // on screen, their focus, and how many are shown stay until the query
+  // reruns on the new list.
+  async refreshChannels(): Promise<void> {
+    this.channelLoad = false;
+    if (!this.active) return;
+    if (this.canReuseWorkerIndex(this.account)) {
+      // The load left the list as it was; only the loading hint goes.
+      this.render();
+      return;
+    }
+    // A channel build in flight or a lost index starts over; a catalog or
+    // guide still indexing carries on and settles the index itself.
+    if (this.pendingIndex?.channels || this.workerIndexLost
+      || (!this.pendingIndex && !this.workerIndexReady)) {
+      this.queryPending = !!this.query.trim();
+      await this.open(this.account, this.query);
+      return;
+    }
+    const sessionId = this.workerSession;
+    const repost = { sessionId, done: this.repostChannels(sessionId) };
+    this.channelRepost = repost;
+    try {
+      await repost.done;
+    } finally {
+      if (this.channelRepost === repost) this.channelRepost = null;
+    }
+    if (!this.active || sessionId !== this.workerSession) return;
+    if (!this.query.trim()) {
+      this.render();
+      return;
+    }
+    this.requery(true);
+  }
+
+  private async repostChannels(sessionId: number): Promise<void> {
+    const channels = PlaylistService.channels;
+    const complete = PlaylistService.complete;
+    this.invalidateWorkerIndex();
+    const posted = await this.postSource(
+      sessionId,
+      'channels',
+      channels.length,
+      index => channelDocument(channels[index]),
+    );
+    if (sessionId !== this.workerSession) return;
+    if (!posted) {
+      this.workerIndexLost = true;
+      return;
+    }
+    this.workerChannels = channels;
+    this.workerChannelsComplete = complete;
+    // Program results point at channel indexes, so they follow the new list.
+    let programs = await this.buildProgramIndex(true, sessionId);
+    // A guide that landed meanwhile restarted the build; the repost still
+    // owns marking the index ready, so it builds again.
+    while (programs === null && this.active && sessionId === this.workerSession) {
+      programs = await this.buildProgramIndex(true, sessionId);
+    }
+    if (sessionId !== this.workerSession || programs === null) return;
+    if (this.pendingIndex) {
+      this.programIndexDone(sessionId, programs);
+      return;
+    }
+    if (!programs) {
+      this.workerIndexLost = true;
+      return;
+    }
+    this.markWorkerIndexReady(this.account);
+  }
+
+  refreshLocks(): void {
+    if (this.container.querySelector('.search-view')) this.render();
+  }
+
+  // Locked content was hidden or revealed: drop the rendered results at once,
+  // since their indexes point into the old channel list, then search again.
+  async refreshConcealment(): Promise<void> {
+    this.invalidateCatalog();
+    if (!this.active) return;
+    this.queryPending = !!this.query.trim();
+    await this.open(this.account, this.query);
+  }
+
+  invalidateCatalog(): void {
+    this.abortCatalogLoad();
+    this.pendingIndex = null;
+    this.completingPartial = null;
+    this.workerSession++;
+    this.recoveryRetry = null;
+    this.allVod = [];
+    this.allSeries = [];
+    this.vodCache = null;
+    this.seriesCache = null;
+    this.vodRecord = null;
+    this.seriesRecord = null;
+    this.delivered = deliveredItems(-1);
+    this.loadedFor = null;
+    this.nav.resetRecovery();
+    this.clearResults();
+    this.invalidateWorkerIndex();
+  }
+
+  dismissPrompt(): void {
+    this.resumePrompt.hide();
+  }
+
+  private abortRecordFallback(): void {
+    this.recordFallback?.abort();
+    this.recordFallback = null;
+  }
+
+  deactivate(): void {
+    this.active = false;
+    this.abortRecordFallback();
+    this.focusPending = false;
+    this.programIndexGeneration++;
+    this.recoveryRetry = null;
+    this.releaseWorker?.();
+    this.releaseWorker = null;
+    this.queryPending = false;
+    this.delivered = deliveredItems(-1);
+  }
+
+  handleAction(action: Action): void {
+    this.focusPending = false;
+    if (this.resumePrompt.visible) {
+      this.resumePrompt.handleAction(action);
+      return;
+    }
+    if (isFocusMove(action) && this.nav.showConcealed()) return;
+    if (this.moveVirtualFocus(action)) return;
+    switch (action) {
+      case 'up':
+        if (!this.nav.move('up')) this.handlers.onRevealTabBar();
+        return;
+      case 'down':
+      case 'left':
+      case 'right':
+        this.nav.move(action);
+        return;
+      case 'select':
+        this.onSelect();
+        return;
+      case 'back':
+        this.handlers.onBack();
+        return;
+      default:
+        return;
+    }
+  }
+
+  // Load the whole catalogs once per account (cached in IndexedDB). A reopen
+  // shares the load in flight; only an account switch or a concealment change
+  // aborts it, so a stale load can't clobber the current account's catalog.
+  private loadCatalog(account: PlaylistEntry): Promise<CatalogSources> {
+    if (this.loadedFor === account.id && Date.now() < this.catalogExpiresAt) {
+      return Promise.resolve({ movies: true, series: true });
+    }
+    if (this.catalogLoad?.accountId === account.id) return this.catalogLoad.promise;
+    const controller = new AbortController();
+    this.catalogController = controller;
+    const promise = this.fetchCatalog(account, controller.signal);
+    const load = { accountId: account.id, promise };
+    this.catalogLoad = load;
+    const done = (): void => {
+      if (this.catalogLoad === load) this.catalogLoad = null;
+      if (this.catalogController === controller) this.catalogController = null;
+    };
+    promise.then(done, done);
+    return promise;
+  }
+
+  private async fetchCatalog(account: PlaylistEntry, signal: AbortSignal): Promise<CatalogSources> {
+    const [vod, series] = await Promise.all([
+      captureCatalogLoad(loadCatalogSource(account, signal, syncAllVodStreams, loadAllVodStreams)),
+      captureCatalogLoad(loadCatalogSource(account, signal, syncAllSeries, loadAllSeries)),
+    ]);
+    if (signal.aborted || this.account?.id !== account.id
+      || this.catalogController?.signal !== signal) return { movies: false, series: false };
+    const concealing = ParentalControlService.concealing;
+    if (vod.ok && vod.data.record) {
+      const record = {
+        record: vod.data.record,
+        concealment: ParentalControlService.catalogConcealment('vod', account.id),
+      };
+      if (!sameCatalogRecord(this.vodRecord, record)) this.allVod = recordList();
+      this.vodRecord = record;
+      this.vodCache = null;
+    } else if (vod.ok && vod.data.data) {
+      const visible = selectCatalogItems(vod.data.data, concealing, isVodConcealed);
+      const cache = cachedNamesRequest(vod.data.data, visible.items, visible.selection);
+      if (!sameCatalogSource(this.vodCache, cache)) this.allVod = visible.items;
+      this.vodRecord = null;
+      this.vodCache = cache;
+    } else if (!vod.ok) {
+      log.error(
+        'Movie search catalog load failed',
+        'event=xtream.search.load.failed',
+        'resource=movies',
+        vod.error,
+      );
+    }
+    if (series.ok && series.data.record) {
+      const record = {
+        record: series.data.record,
+        concealment: ParentalControlService.catalogConcealment('series', account.id),
+      };
+      if (!sameCatalogRecord(this.seriesRecord, record)) this.allSeries = recordList();
+      this.seriesRecord = record;
+      this.seriesCache = null;
+    } else if (series.ok && series.data.data) {
+      const visible = selectCatalogItems(series.data.data, concealing, isSeriesConcealed);
+      const cache = cachedNamesRequest(series.data.data, visible.items, visible.selection);
+      if (!sameCatalogSource(this.seriesCache, cache)) this.allSeries = visible.items;
+      this.seriesRecord = null;
+      this.seriesCache = cache;
+    } else if (!series.ok) {
+      log.error(
+        'Series search catalog load failed',
+        'event=xtream.search.load.failed',
+        'resource=series',
+        series.error,
+      );
+    }
+    if (vod.ok && series.ok) {
+      const expiresAt = await getSearchCatalogExpiresAt(account.id) ?? 0;
+      if (signal.aborted || this.account?.id !== account.id
+        || this.catalogController?.signal !== signal) return { movies: false, series: false };
+      this.loadedFor = account.id;
+      this.catalogExpiresAt = expiresAt;
+      log.debug(
+        'catalog loaded',
+        vod.data.data?.length ?? 'record',
+        'movies,',
+        series.data.data?.length ?? 'record',
+        'series',
+      );
+    }
+    return { movies: vod.ok, series: series.ok };
+  }
+
+  private abortCatalogLoad(): void {
+    this.abortRecordFallback();
+    this.catalogController?.abort();
+    this.catalogController = null;
+    this.catalogLoad = null;
+    this.catalogLoading = false;
+  }
+
+  // A stale catalog was served at once and has now been re-fetched: index the
+  // new copy for an open Search, or leave it for the next open.
+  private onCatalogRefreshed(key: string, changed = true): void {
+    const account = this.account;
+    if (!account || this.loadedFor !== account.id) return;
+    if (key !== `${account.id}|vod_all` && key !== `${account.id}|series_all`) return;
+    if (!changed) {
+      void getSearchCatalogExpiresAt(account.id).then(expiresAt => {
+        if (this.account?.id === account.id && this.loadedFor === account.id) {
+          this.catalogExpiresAt = expiresAt ?? 0;
+        }
+      }).catch((error: unknown) => {
+        log.error('Search catalog refresh failed', 'event=search.worker.index.failed', 'scope=catalog', error);
+      });
+      return;
+    }
+    this.loadedFor = null;
+    this.catalogExpiresAt = 0;
+    this.abortCatalogLoad();
+    if (!this.active || this.pendingIndex) return;
+    this.refreshCatalogIndex(account);
+  }
+
+  private refreshCatalogIndex(account: PlaylistEntry): void {
+    const sessionId = this.workerSession;
+    const refreshed = async (indexed: boolean, reason = 'rejected'): Promise<void> => {
+      if (!this.active || sessionId !== this.workerSession || this.account?.id !== account.id) return;
+      if (!indexed) this.indexLost(sessionId, reason, 'catalog');
+      else if (this.workerIndexReady) this.markWorkerIndexReady(account);
+      if (this.query.trim()) await this.startQuery(++this.queryGeneration);
+    };
+    void this.loadCatalog(account).then(async (sources) => {
+      if (!this.active || sessionId !== this.workerSession || this.account?.id !== account.id) return;
+      if (this.workerIndexLost) {
+        // The rebuild re-reads the lists; a post of this copy could land after its own.
+        if (this.query.trim()) await this.startQuery(++this.queryGeneration);
+        return;
+      }
+      const movies = sources.movies && this.indexedVod !== this.allVod;
+      const series = sources.series && this.indexedSeries !== this.allSeries;
+      if (movies || series) await refreshed(await this.indexCatalog(sessionId, movies, series));
+    }).catch(async (error: unknown) => {
+      log.error('Search catalog refresh failed', 'event=search.worker.index.failed', 'scope=catalog', error);
+      await refreshed(false, 'error');
+    });
+  }
+
+  // null: a newer program index build took over and settles instead.
+  private programIndexDone(sessionId: number, indexed: boolean | null): void {
+    if (indexed) this.indexSettled(sessionId, 'programmes');
+    else if (indexed === false) this.indexLost(sessionId, 'rejected', 'programmes');
+  }
+
+  // The sources are settled but the worker may hold a partial index: the
+  // first query after the last pending source rebuilds it whole.
+  private indexLost(sessionId: number, reason: string, ...sources: Array<keyof PendingIndex>): void {
+    if (sessionId !== this.workerSession) return;
+    for (const source of sources) {
+      log.warn(
+        'Search index incomplete; the next query rebuilds it',
+        'event=search.index.lost',
+        `session=${String(sessionId)}`,
+        `source=${source}`,
+        `reason=${reason}`,
+      );
+    }
+    this.workerIndexLost = true;
+    if (this.pendingIndex) {
+      this.lostSources = { ...this.lostSources };
+      for (const source of sources) this.lostSources[source] = true;
+    }
+    this.indexSettled(sessionId, ...sources);
+  }
+
+  private logIndexReady(mode: string): void {
+    const stats = this.indexStats;
+    const now = Date.now();
+    const fields = mode === 'reused'
+      ? []
+      : [
+        `persisted=${String(stats.persisted)}`,
+        `built=${String(stats.built)}`,
+        `posted=${String(stats.posted)}`,
+        `elapsedMs=${String(now - stats.startedAt)}`,
+        `hintMs=${String(stats.hintAt ? now - stats.hintAt : 0)}`,
+      ];
+    log.info(
+      'Search index ready',
+      'event=search.index.ready',
+      `session=${String(this.workerSession)}`,
+      `mode=${mode}`,
+      `channels=${String(PlaylistService.channels.length)}`,
+      `programmes=${String(this.programIndex.length)}`,
+      `items=${String(this.allVod.length + this.allSeries.length)}`,
+      ...fields,
+      `catalog=${this.vodRecord || this.seriesRecord ? 'record' : 'list'}`,
+    );
+  }
+
+  private indexMode(): string {
+    const stats = this.indexStats;
+    if (this.workerIndexLost) return 'lost';
+    if (stats.posted) return 'fallback';
+    if (stats.built) return 'cache';
+    return 'persisted';
+  }
+
+  private indexSettled(sessionId: number, ...sources: Array<keyof PendingIndex>): void {
+    const pending = this.pendingIndex;
+    if (!pending || sessionId !== this.workerSession) return;
+    const wasPartial = this.partialIndex();
+    for (const source of sources) pending[source] = false;
+    if (pending.channels) return;
+    if (pending.programmes || pending.catalog) {
+      // Channels answer at once; programs and the catalog join as they land.
+      if (this.active && this.query.trim()) this.requery(wasPartial);
+      return;
+    }
+    this.pendingIndex = null;
+    this.logIndexReady(this.indexMode());
+    if (!this.workerIndexLost) this.markWorkerIndexReady(this.account);
+    if (!this.active) return;
+    if (!this.query.trim()) {
+      this.render();
+      return;
+    }
+    this.requery(wasPartial);
+  }
+
+  private requery(wasPartial: boolean): void {
+    const generation = ++this.queryGeneration;
+    if (!wasPartial) {
+      void this.startQuery(generation);
+      return;
+    }
+    // Keep the partial results on screen, and their focus, until the fuller set replaces them.
+    this.completingPartial = generation;
+    void this.startQuery(generation, true).then(() => {
+      if (this.completingPartial === generation) this.completingPartial = null;
+      if (generation !== this.queryGeneration) return;
+      this.applyPendingFocus();
+    });
+  }
+
+  // The playlist is still loading, or its full list is being indexed and
+  // searched again: channel results may still change.
+  private channelsArriving(): boolean {
+    return this.channelLoad
+      || this.channelRepost?.sessionId === this.workerSession
+      || this.completingPartial !== null;
+  }
+
+  // Channels are searchable while programs or the catalog still load.
+  private partialIndex(): boolean {
+    const pending = this.pendingIndex;
+    if (!pending || pending.channels || !(pending.programmes || pending.catalog)) return false;
+    return !this.workerIndexLost || (!!this.lostSources && !this.lostSources.channels);
+  }
+
+  private onSelect(): void {
+    const el = this.nav.focused;
+    // A result a re-render removed opens nothing; the next arrow recovers focus.
+    if (!el || !this.container.contains(el)) return;
+    if (el.classList.contains('search-input')) {
+      const input = el as HTMLInputElement;
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+      return;
+    }
+    // Only a query that opened something is worth remembering, not every keystroke.
+    const query = this.query;
+    if (el.dataset.channelIndex !== undefined) {
+      const index = parseInt(el.dataset.channelIndex, 10);
+      const channel = PlaylistService.channels[index];
+      if (channel) rememberQuery(query, liveParentalRequest(channel));
+      this.handlers.onPlayChannel(index);
+    } else if (el.dataset.programIndex !== undefined) {
+      void this.activateProgram(parseInt(el.dataset.programIndex, 10), query);
+    } else if (this.account && el.dataset.streamId !== undefined) {
+      const v = this.visibleMovies.find((x) => x.streamId === el.dataset.streamId);
+      if (!v) return;
+      rememberQuery(query, catalogParentalRequest('vod', { ...v, id: v.streamId }));
+      this.handlers.onOpenMovie(this.account, v);
+    } else if (this.account && el.dataset.seriesId !== undefined) {
+      const s = this.visibleSeries.find((x) => x.seriesId === el.dataset.seriesId);
+      if (!s) return;
+      rememberQuery(query, catalogParentalRequest('series', { ...s, id: s.seriesId }));
+      this.handlers.onOpenSeries(this.account, s);
+    }
+  }
+
+  /** Move focus into the first result (called when the tab bar's search box
+   *  hands off with Enter / Down). */
+  focusFirstResult(): void {
+    this.focusPending = true;
+    this.focusWaitingInBox = false;
+    if (this.queryFrame !== null) {
+      this.cancelScheduledQuery();
+      void this.startQuery(this.queryGeneration);
+      return;
+    }
+    this.applyPendingFocus();
+  }
+
+  // Waits out superseded queries and a catalog still loading: only a render of
+  // the latest query with something to focus completes the handoff.
+  private applyPendingFocus(): void {
+    if (!this.focusPending || !this.active || this.queryPending) return;
+    const first = this.container.querySelector<HTMLElement>('.search-results [data-focusable]');
+    if (!first && (this.catalogLoading || this.pendingIndex || this.channelsArriving())) {
+      // Wait in the search box, not on a blank screen, for the catalog or channels.
+      if (!this.focusWaitingInBox) {
+        this.focusWaitingInBox = true;
+        this.handlers.onRevealTabBar();
+      }
+      return;
+    }
+    const waited = this.focusWaitingInBox;
+    this.focusWaitingInBox = false;
+    this.focusPending = false;
+    // Nothing matched: keep the remote in the search box, not on a blank screen.
+    if (!first) {
+      if (!waited) this.handlers.onRevealTabBar();
+      return;
+    }
+    if (waited) {
+      // The remote moved on from the box meanwhile: don't pull it back.
+      if (!document.activeElement?.classList.contains('tab-bar-search-input')) return;
+      this.handlers.onReleaseTabBar();
+    }
+    this.nav.focus(first);
+  }
+
+  private posterCell(name: string, poster: string): ReturnType<typeof html> {
+    return poster
+      ? html`<img class="catalog-poster" src="${poster}" alt="" loading="lazy" onerror="this.style.display='none'">`
+      : html`<div class="catalog-poster catalog-poster-empty">${name.charAt(0)}</div>`;
+  }
+
+  private virtualRail<T>(
+    title: string,
+    key: string,
+    items: T[],
+    virtualizer: VirtualList,
+    renderItem: (item: T) => ReturnType<typeof html>,
+  ): ReturnType<typeof html> {
+    const viewport = this.container.querySelector<HTMLElement>(
+      `[data-search-virtual="${key}"]`,
+    )?.clientWidth || SEARCH_RAIL_VIEWPORT;
+    const range = virtualizer.getRange(items.length, viewport);
+    this.railWindows.set(key, this.railWindow(items.length, range));
+    // Left and Right stop at a section's ends; only Up and Down leave it.
+    return html`
+      <div class="catalog-rail" data-nav-container data-nav-leave-left="" data-nav-leave-right="">
+        <h2 class="catalog-rail-title">${title}</h2>
+        <div class="catalog-rail-track search-virtual-rail ${
+               key === 'channels-rail' ? 'search-channel-rail' : ''
+             }"
+             data-edge-scroll data-search-virtual="${key}" data-search-axis="horizontal">
+          <div class="search-virtual-rail-spacer"
+               style="width:${virtualizer.getTotalSize(items.length)}px">
+            ${items.slice(range.start, range.end).map((item, offset) => {
+              const index = range.start + offset;
+              return html`
+                <div class="search-virtual-rail-cell"
+                     data-key="${key}:${index}"
+                     data-search-section="${key}" data-search-index="${index}"
+                     style="left:${virtualizer.getItemOffset(index)}px">
+                  ${renderItem(item)}
+                </div>
+              `;
+            })}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  private virtualList<T>(
+    title: string,
+    key: string,
+    items: T[],
+    virtualizer: VirtualList,
+    renderItem: (item: T, index: number) => ReturnType<typeof html>,
+  ): ReturnType<typeof html> {
+    const viewport = this.container.querySelector<HTMLElement>(
+      `[data-search-virtual="${key}"]`,
+    )?.clientHeight || SEARCH_LIST_VIEWPORT;
+    const range = virtualizer.getRange(items.length, viewport);
+    return html`
+      <div class="search-virtual-section ${key === 'programmes' ? 'search-programs' : ''}" data-nav-container data-nav-leave-left="" data-nav-leave-right="">
+        <h2 class="catalog-rail-title">${title}</h2>
+        <div class="search-virtual-scroll"
+             data-search-virtual="${key}" data-search-axis="vertical">
+          <div class="search-virtual-list-spacer"
+               style="height:${virtualizer.getTotalSize(items.length)}px">
+            ${items.slice(range.start, range.end).map((item, offset) => {
+              const index = range.start + offset;
+              return html`
+                <div class="search-virtual-list-cell"
+                     data-key="${key}:${index}"
+                     data-search-section="${key}" data-search-index="${index}"
+                     style="top:${virtualizer.getItemOffset(index)}px">
+                  ${renderItem(item, index)}
+                </div>
+              `;
+            })}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  private channelTile(ch: Channel): ReturnType<typeof html> {
+    const idx = PlaylistService.indexOf(ch);
+    return html`
+      <div class="catalog-tile search-channel-tile" data-focusable data-key="ch:${String(idx)}"
+           data-channel-index="${String(idx)}">
+        <div class="catalog-poster-wrap">${this.posterCell(ch.name, ch.logo)}${
+          raw(channelLockBadge(ch))}</div>
+        <div class="catalog-tile-name">${ch.name}</div>
+      </div>
+    `;
+  }
+
+  private movieTile(v: VodItem): ReturnType<typeof html> {
+    return html`
+      <div class="catalog-tile" data-focusable data-key="v:${v.streamId}" data-stream-id="${v.streamId}">
+        <div class="catalog-poster-wrap">${this.posterCell(v.name, v.poster)}${
+          raw(vodLockBadge(v))}</div>
+        <div class="catalog-tile-name">${v.name}</div>
+      </div>
+    `;
+  }
+
+  private seriesTile(s: SeriesItem): ReturnType<typeof html> {
+    return html`
+      <div class="catalog-tile" data-focusable data-key="s:${s.seriesId}" data-series-id="${s.seriesId}">
+        <div class="catalog-poster-wrap">${this.posterCell(s.name, s.poster)}${
+          raw(seriesLockBadge(s))}</div>
+        <div class="catalog-tile-name">${s.name}</div>
+      </div>
+    `;
+  }
+
+  private async buildProgramIndex(force: boolean, sessionId: number): Promise<boolean | null> {
+    if (!force
+        && this.indexedChannels === PlaylistService.channels
+        && this.indexedGuideRevision === EpgService.guideRevision) {
+      return this.indexProgrammes(sessionId);
+    }
+    const generation = ++this.programIndexGeneration;
+    const channels = PlaylistService.channels;
+    const guideRevision = EpgService.guideRevision;
+    const programs: ProgramResult[] = [];
+    const runs = new ProgrammeRuns();
+    let channelIndex = 0;
+    let channelPrograms: Programme[] = [];
+    let programmeIndex = 0;
+    const shouldContinue = (): boolean =>
+      this.active && generation === this.programIndexGeneration;
+    const collected = await runInFrameSlices(() => {
+      if (programmeIndex < channelPrograms.length) {
+        programs.push({
+          channel: channels[channelIndex - 1],
+          channelIndex: channelIndex - 1,
+          programme: channelPrograms[programmeIndex++],
+        });
+        return false;
+      }
+      if (channelIndex >= channels.length) return true;
+      const channel = channels[channelIndex++];
+      const epgId = EpgService.findChannelId(channel);
+      channelPrograms = epgId ? EpgService.getProgrammes(epgId) ?? [] : [];
+      programmeIndex = 0;
+      if (epgId && channelPrograms.length) {
+        runs.add(channelIndex - 1, EpgService.programmeCacheOrigin(epgId), channelPrograms.length);
+      }
+      return false;
+    }, { shouldContinue });
+    if (!collected) return null;
+
+    this.programIndex = programs;
+    this.programRuns = runs;
+    this.indexedChannels = channels;
+    this.indexedGuideRevision = guideRevision;
+    return this.indexProgrammes(sessionId);
+  }
+
+  private indexProgrammes(sessionId: number): Promise<boolean> {
+    const programs = this.programIndex;
+    const postProgrammes = (): Promise<boolean> => this.postSource(
+      sessionId,
+      'programmes',
+      programs.length,
+      index => programDocument(programs[index]),
+    );
+    // Cached programme documents join the worker's channel documents, so
+    // they must come from the very channel list the program index walked.
+    const cachedProgrammes = this.workerChannels === this.indexedChannels
+      && sessionId === this.workerSession
+      ? this.programRuns.request(
+        sampleDocuments(programs.length, index => programDocument(programs[index])),
+      )
+      : null;
+    return cachedProgrammes
+      ? this.indexWorkerFromCache({ sessionId, cachedProgrammes }, postProgrammes)
+      : postProgrammes();
+  }
+
+  private async indexCatalog(sessionId: number, movies: boolean, series: boolean): Promise<boolean> {
+    const vod = this.allVod;
+    const allSeries = this.allSeries;
+    // A newer refresh may have replaced a list; its own index adopts that one.
+    const adopt = (sources: SearchIndexSource[]): void => {
+      if (sessionId !== this.workerSession) return;
+      if (sources.indexOf('movies') >= 0 && vod === this.allVod) this.indexedVod = vod;
+      if (sources.indexOf('series') >= 0 && allSeries === this.allSeries) this.indexedSeries = allSeries;
+    };
+    const post = async (sources: SearchIndexSource[]): Promise<boolean> => {
+      for (const source of sources) {
+        let items: Array<{ name: string }> = source === 'movies' ? vod : allSeries;
+        // A newer refresh replaced this list and posts its own; an older post
+        // landing after it would leave the worker on the older list.
+        if (items !== (source === 'movies' ? this.allVod : this.allSeries)) continue;
+        if (isRecordList(items)) {
+          const group = source === 'movies' ? 'movies' : 'series';
+          const list = await this.leaveRecordMode(sessionId, group);
+          if (list === 'replaced') continue;
+          if (list === 'synced') {
+            const record = group === 'movies' ? this.vodRecord : this.seriesRecord;
+            if (!record) return false;
+            const retry: SearchIndexRequest = group === 'movies'
+              ? { sessionId, catalogMovies: record }
+              : { sessionId, catalogSeries: record };
+            if (!await this.indexWorkerFromCache(retry, post, adopt)) return false;
+            continue;
+          }
+          if (!list) return false;
+          items = list;
+        }
+        const names = items;
+        const result = this.postSource(sessionId, source, names.length, index => names[index].name);
+        const own = this.sourcePosts[source];
+        if (!await result) return false;
+        // A newer post replaced this one and shares its outcome, not its list.
+        if (this.sourcePosts[source] === own && sessionId === this.workerSession) {
+          if (source === 'movies') this.indexedVod = names as VodItem[];
+          else this.indexedSeries = names as SeriesItem[];
+        }
+      }
+      return true;
+    };
+    const request: SearchIndexRequest = { sessionId };
+    const posted: SearchIndexSource[] = [];
+    if (movies && this.vodRecord) request.catalogMovies = this.vodRecord;
+    else if (movies && this.vodCache) request.cachedMovies = this.vodCache;
+    else if (movies) posted.push('movies');
+    if (series && this.seriesRecord) request.catalogSeries = this.seriesRecord;
+    else if (series && this.seriesCache) request.cachedSeries = this.seriesCache;
+    else if (series) posted.push('series');
+    if (!request.cachedMovies && !request.cachedSeries
+      && !request.catalogMovies && !request.catalogSeries) return post(posted);
+    const cached = await this.indexWorkerFromCache(request, post, adopt);
+    return cached && post(posted);
+  }
+
+  // The worker could not read the catalog record. Syncing it again once lets
+  // the worker read or fetch it; failing that, the list loads here and its
+  // names are posted. 'replaced': a newer load took over the source.
+  private leaveRecordMode(sessionId: number, source: 'movies' | 'series'): Promise<RecordFallback> {
+    const running = this.fallbacks[source];
+    if (running && running.sessionId === sessionId) return running.result;
+    const result = this.fallBack(sessionId, source);
+    const entry = { sessionId, result };
+    this.fallbacks[source] = entry;
+    const done = (): void => { if (this.fallbacks[source] === entry) delete this.fallbacks[source]; };
+    result.then(done, done);
+    return result;
+  }
+
+  private async fallBack(sessionId: number, source: 'movies' | 'series'): Promise<RecordFallback> {
+    const account = this.account;
+    if (!account || !this.active) return null;
+    const standIn = source === 'movies' ? this.allVod : this.allSeries;
+    const current = (): boolean => sessionId === this.workerSession
+      && (source === 'movies' ? this.allVod : this.allSeries) === standIn;
+    const concealing = ParentalControlService.concealing;
+    if (!this.recordFallback) this.recordFallback = new AbortController();
+    const signal = this.recordFallback.signal;
+    try {
+      if (this.resynced[source] !== sessionId) {
+        this.resynced[source] = sessionId;
+        const record = await (source === 'movies' ? syncAllVodStreams : syncAllSeries)(account, signal);
+        if (!current()) return 'replaced';
+        const failed = source === 'movies' ? this.vodRecord : this.seriesRecord;
+        // The same reference would only fail the same way again.
+        if (record && !(failed && sameCacheRef(failed.record, record))) {
+          const kind = source === 'movies' ? 'vod' : 'series';
+          const catalog = { record, concealment: ParentalControlService.catalogConcealment(kind, account.id) };
+          if (source === 'movies') this.vodRecord = catalog;
+          else this.seriesRecord = catalog;
+          return 'synced';
+        }
+      }
+      if (source === 'movies') {
+        const data = await loadAllVodStreams(account, signal);
+        if (!current()) return 'replaced';
+        this.allVod = selectCatalogItems(data, concealing, isVodConcealed).items;
+        this.vodRecord = null;
+        return this.allVod;
+      }
+      const data = await loadAllSeries(account, signal);
+      if (!current()) return 'replaced';
+      this.allSeries = selectCatalogItems(data, concealing, isSeriesConcealed).items;
+      this.seriesRecord = null;
+      return this.allSeries;
+    } catch (error) {
+      if (signal.aborted) return null;
+      log.error('Search catalog load failed', 'event=xtream.search.load.failed', `resource=${source}`, error);
+      return null;
+    }
+  }
+
+  private async indexWorker(request: SearchIndexRequest): Promise<boolean> {
+    const pending = runAppWorkerTask('search.index', request);
+    // Record the worker that took the reset, not whichever one runs when the index is marked ready.
+    const generation = appWorkerGeneration();
+    const response = await pending;
+    const accepted = response.accepted && request.sessionId === this.workerSession;
+    if (accepted && request.reset) {
+      this.workerResetGeneration = generation;
+      this.indexedVod = [];
+      this.indexedSeries = [];
+    }
+    return accepted;
+  }
+
+  // The worker reads the documents from IndexedDB; whatever it could not
+  // read or verify is posted as plain arrays instead.
+  private async indexWorkerFromCache(
+    request: SearchIndexRequest,
+    post: (sources: SearchIndexSource[]) => Promise<boolean>,
+    loaded?: (sources: SearchIndexSource[]) => void,
+  ): Promise<boolean> {
+    const response = await runAppWorkerTask('search.index', request);
+    void persistSearchIndexes(response.persist);
+    if (!response.accepted || request.sessionId !== this.workerSession) return false;
+    if (loaded) {
+      const unresolved = (response.unresolved ?? []).map(entry => entry.source);
+      const sources: SearchIndexSource[] = [];
+      if ((request.cachedMovies || request.catalogMovies) && unresolved.indexOf('movies') < 0) sources.push('movies');
+      if ((request.cachedSeries || request.catalogSeries) && unresolved.indexOf('series') < 0) sources.push('series');
+      loaded(sources);
+    }
+    if (response.loaded) {
+      this.indexStats.persisted += response.loaded.persisted;
+      this.indexStats.built += response.loaded.built;
+    }
+    const unresolved = response.unresolved;
+    if (!unresolved?.length) return true;
+    for (const entry of unresolved) {
+      log.info(
+        'Search index cache unavailable; posting documents',
+        'event=search.worker.cache.fallback',
+        `session=${String(request.sessionId)}`,
+        `source=${entry.source}`,
+        `reason=${entry.reason}`,
+      );
+    }
+    return post(unresolved.map(entry => entry.source));
+  }
+
+  // The worker stages one sequence per source, so posts of a source take
+  // turns; one replaced by a newer post ends early and shares its outcome.
+  private postSource(
+    sessionId: number,
+    source: SearchIndexSource,
+    total: number,
+    documentAt: (index: number) => string[] | string,
+  ): Promise<boolean> {
+    const previous = this.sourcePosts[source];
+    if (total && this.pendingIndex && sessionId === this.workerSession) this.indexStats.posted++;
+    let sent = (): void => undefined;
+    const post: SourcePost = {
+      id: ++this.sourcePostId,
+      sent: new Promise<void>(resolve => { sent = resolve; }),
+      result: Promise.resolve(false),
+    };
+    this.sourcePosts[source] = post;
+    post.result = (async (): Promise<boolean> => {
+      let posts: Promise<boolean>[] | null;
+      try {
+        if (previous) await previous.sent;
+        posts = await this.postChunks(post.id, sessionId, source, total, documentAt);
+      } finally {
+        sent();
+      }
+      if (!posts) return this.sourcePosts[source]!.result;
+      const accepted = await Promise.all(posts);
+      return accepted.length > 0 && accepted.every(Boolean) && sessionId === this.workerSession;
+    })();
+    return post.result;
+  }
+
+  // Post a source in slices, one per frame, so no single message clones
+  // enough text to stall an animation. null: a newer post replaced this one.
+  private async postChunks(
+    id: number,
+    sessionId: number,
+    source: SearchIndexSource,
+    total: number,
+    documentAt: (index: number) => string[] | string,
+  ): Promise<Promise<boolean>[] | null> {
+    const size = CONFIG.SEARCH.INDEX_CHUNK_SIZE;
+    const posts: Promise<boolean>[] = [];
+    let start = 0;
+    do {
+      if (start > 0) await nextFrame();
+      if (this.sourcePosts[source]?.id !== id) {
+        void Promise.all(posts).catch(() => undefined);
+        return null;
+      }
+      if (sessionId !== this.workerSession) break;
+      const end = Math.min(total, start + size);
+      const chunk: SearchIndexChunk = { source, start, total };
+      if (source === 'movies' || source === 'series') {
+        const names: string[] = [];
+        for (let index = start; index < end; index++) names.push(documentAt(index) as string);
+        chunk.names = names;
+      } else {
+        const documents: string[][] = [];
+        for (let index = start; index < end; index++) documents.push(documentAt(index) as string[]);
+        chunk.documents = documents;
+      }
+      posts.push(this.indexWorker({ sessionId, chunk }));
+      start = end;
+    } while (start < total);
+    return posts;
+  }
+
+  private startQuery(generation: number, preserveOffsets = false): Promise<void> {
+    return this.runWorkerQuery(generation, preserveOffsets).catch(error => {
+      log.error(
+        'Search result update failed',
+        'event=search.results.update.failed',
+        error,
+      );
+    });
+  }
+
+  private async runWorkerQuery(generation: number, preserveOffsets: boolean): Promise<void> {
+    const repost = this.channelRepost;
+    if (repost && repost.sessionId === this.workerSession) {
+      // A new query must not leave the last one's results up to be picked.
+      if (!preserveOffsets && this.query.trim()) {
+        this.queryPending = true;
+        this.render();
+      }
+      await repost.done;
+      if (generation !== this.queryGeneration) return;
+    }
+    const query = this.query;
+    const sessionId = this.workerSession;
+    if (!query.trim()) return;
+    const partial = this.partialIndex();
+    if (this.pendingIndex && !partial) {
+      // The ready index runs this query; until then the hint stands in.
+      if (!this.indexStats.hintAt) this.indexStats.hintAt = Date.now();
+      this.render();
+      this.applyPendingFocus();
+      return;
+    }
+    if (!preserveOffsets) {
+      this.queryPending = true;
+      this.render();
+    }
+    let response: SearchQueryResponse | null = null;
+    let recoveryAttempted = false;
+    // A rebuild failed recently: rank on the main thread, quietly, until the delay passes.
+    let retryPending = false;
+    const lists = this.indexedLists();
+    try {
+      if (this.workerIndexLost && !partial) {
+        recoveryAttempted = true;
+        retryPending = this.recoveryRetryPending(sessionId);
+        if (!retryPending) response = await this.recoverWorkerQuery(sessionId, query, 'lost');
+      } else {
+        const pending = runAppWorkerTask('search.query', this.queryRequest({
+          sessionId,
+          query,
+          limit: CONFIG.SEARCH.RESULTS,
+          includeCatalog: !!this.account && !this.pendingIndex?.catalog && !this.lostSources?.catalog,
+          includeProgrammes: !this.pendingIndex?.programmes && !this.lostSources?.programmes,
+        }));
+        const worker = appWorkerGeneration();
+        response = await pending;
+        this.keepDelivered(response, worker);
+      }
+    } catch (error) {
+      if (generation !== this.queryGeneration || sessionId !== this.workerSession || !this.active) return;
+      recoveryAttempted = true;
+      retryPending = this.recoveryRetryPending(sessionId);
+      if (!retryPending) {
+        log.error(
+          'Search worker query failed; rebuilding its index',
+          'event=search.worker.query.failed',
+          'scope=unified',
+          `session=${String(sessionId)}`,
+          error,
+        );
+        response = await this.recoverWorkerQuery(sessionId, query, 'query_failed');
+      }
+    }
+    if (generation !== this.queryGeneration || sessionId !== this.workerSession || !this.active) {
+      return;
+    }
+    if (!response && !recoveryAttempted) {
+      retryPending = this.recoveryRetryPending(sessionId);
+    }
+    if (!response && !recoveryAttempted && !retryPending) {
+      log.warn(
+        'Search worker lost its index; rebuilding it',
+        'event=search.worker.index.missing',
+        'scope=unified',
+        `session=${String(sessionId)}`,
+      );
+      response = await this.recoverWorkerQuery(sessionId, query, 'missing');
+      if (generation !== this.queryGeneration || sessionId !== this.workerSession || !this.active) {
+        return;
+      }
+    }
+    if (response && !sameLists(lists, this.indexedLists())) {
+      // The lists changed under the reply, so its indices may not map onto them.
+      return this.runWorkerQuery(generation, preserveOffsets);
+    }
+    if (response) {
+      this.applyQueryResponse(response, this.indexedVod, this.indexedSeries);
+      this.catalogQuery = query;
+    } else {
+      if (!retryPending) {
+        log.warn(
+          'Worker search failed; using main-thread fallback',
+          'event=search.worker.fallback.used',
+          'scope=unified',
+          `session=${String(sessionId)}`,
+        );
+      }
+      const movies = this.visibleMovies;
+      const series = this.visibleSeries;
+      this.applyQueryResponse(this.queryLocally(query), this.allVod, this.allSeries);
+      // A record cannot rank here, so the worker's last answer to this query stands.
+      if (this.catalogQuery === query) {
+        if (isRecordList(this.allVod)) this.visibleMovies = movies;
+        if (isRecordList(this.allSeries)) this.visibleSeries = series;
+      } else {
+        this.catalogQuery = null;
+      }
+    }
+    this.queryPending = false;
+    // The latest query's results are the fullest; no older partial one is pending.
+    if (generation === this.queryGeneration) this.completingPartial = null;
+    if (!preserveOffsets) this.resetVirtualOffsets();
+    this.render();
+    this.applyPendingFocus();
+  }
+
+  private queryLocally(query: string): SearchQueryResponse {
+    const { RESULTS, FUZZY_FILL } = CONFIG.SEARCH;
+    const channels = PlaylistService.searchLocalRanked(query, RESULTS, undefined, FUZZY_FILL);
+    const programmes = rankPreparedTopK(
+      prepareSearchItems(this.programIndex, programDocument),
+      query,
+      RESULTS,
+      FUZZY_FILL,
+    );
+    const movies = this.account
+      ? rankPreparedNamesTopK(prepareNameSearchItems(this.allVod), query, RESULTS)
+      : { items: [] };
+    const series = this.account
+      ? rankPreparedNamesTopK(prepareNameSearchItems(this.allSeries), query, RESULTS)
+      : { items: [] };
+    return {
+      channels: { indices: channels.items.map(channel => PlaylistService.indexOf(channel)) },
+      programmes: { indices: indicesOf(this.programIndex, programmes.items) },
+      movies: { indices: indicesOf(this.allVod, movies.items) },
+      series: { indices: indicesOf(this.allSeries, series.items) },
+    };
+  }
+
+  private queryRequest(request: SearchQueryRequest): SearchQueryRequest {
+    // Every worker numbers its epochs from the start, so another worker's
+    // epoch could match the kept one by chance.
+    if (appWorkerGeneration() !== this.deliveredWorker) this.delivered = deliveredItems(-1);
+    const kept = this.delivered;
+    const cap = CONFIG.SEARCH.DELIVERED_KEEP;
+    // -1 past the cap: the worker starts a new epoch, so the page drops the
+    // items that earlier queries left behind.
+    request.delivered = {
+      epoch: kept.epoch,
+      movies: kept.movies.size > cap ? -1 : kept.movies.size,
+      series: kept.series.size > cap ? -1 : kept.series.size,
+    };
+    return request;
+  }
+
+  // Every answer's record items are kept, even one a newer query superseded:
+  // the worker counts them as sent.
+  private keepDelivered(response: SearchQueryResponse | null, worker: number | null): void {
+    const items = response?.items;
+    if (!items) return;
+    this.deliveredWorker = worker;
+    if (items.epoch !== this.delivered.epoch) this.delivered = deliveredItems(items.epoch);
+    const kept = this.delivered;
+    for (const [index, item] of items.movies) kept.movies.set(index, item);
+    for (const [index, item] of items.series) kept.series.set(index, item);
+  }
+
+  private indexedLists(): unknown[] {
+    return [PlaylistService.channels, this.programIndex, this.indexedVod, this.indexedSeries];
+  }
+
+  private async recoverWorkerQuery(
+    sessionId: number,
+    query: string,
+    reason: string,
+  ): Promise<SearchQueryResponse | null> {
+    const startedAt = Date.now();
+    try {
+      let recovery = this.recovery;
+      const owner = !recovery || recovery.sessionId !== sessionId;
+      if (!recovery || owner) {
+        const rebuilt = this.rebuildWorkerIndex(sessionId);
+        const current = { sessionId, done: rebuilt };
+        const clear = (): void => {
+          if (this.recovery === current) this.recovery = null;
+        };
+        // Recorded before any query waiting on the rebuild resumes.
+        const failed = (): void => this.recoveryFailed(sessionId);
+        rebuilt.then(done => { if (!done) failed(); }, failed);
+        current.done.then(clear, clear);
+        this.recovery = current;
+        recovery = current;
+      }
+      if (!await recovery.done) return null;
+      const pending = runAppWorkerTask('search.query', this.queryRequest({
+        sessionId,
+        query,
+        limit: CONFIG.SEARCH.RESULTS,
+        includeCatalog: !!this.account,
+      }));
+      const worker = appWorkerGeneration();
+      const response = await pending;
+      this.keepDelivered(response, worker);
+      if (response && owner) {
+        log.info(
+          'Search worker recovery completed',
+          'event=search.worker.recovery.completed',
+          'scope=unified',
+          `session=${String(sessionId)}`,
+          `reason=${reason}`,
+          `elapsedMs=${String(Date.now() - startedAt)}`,
+        );
+      }
+      return response;
+    } catch (error) {
+      const retry = this.recoveryRetry;
+      if (retry?.sessionId === sessionId) {
+        if (retry.logged) return null;
+        retry.logged = true;
+      }
+      log.error(
+        'Search worker recovery failed',
+        'event=search.worker.recovery.failed',
+        'scope=unified',
+        `session=${String(sessionId)}`,
+        `reason=${reason}`,
+        error,
+      );
+      return null;
+    }
+  }
+
+  private recoveryRetryPending(sessionId: number): boolean {
+    const retry = this.recoveryRetry;
+    // A new worker replaced the one the rebuild failed on, so it may succeed now.
+    return !!retry
+      && retry.sessionId === sessionId
+      && retry.generation === appWorkerGeneration()
+      && performance.now() < retry.at;
+  }
+
+  private recoveryFailed(sessionId: number): void {
+    if (sessionId !== this.workerSession) return;
+    const retry = this.recoveryRetry;
+    this.recoveryRetry = {
+      sessionId,
+      at: performance.now() + CONFIG.SEARCH.INDEX_RETRY_DELAY_MS,
+      generation: appWorkerGeneration(),
+      logged: retry?.sessionId === sessionId && retry.logged,
+    };
+  }
+
+  private async rebuildWorkerIndex(sessionId: number): Promise<boolean> {
+    // Its reset would wipe the newer session's index.
+    if (sessionId !== this.workerSession) return false;
+    // Partial until every source below is in: no refresh may mark it ready
+    // or a reopen reuse it, and queries wait for this rebuild.
+    this.invalidateWorkerIndex();
+    this.workerIndexLost = true;
+    this.lostSources = null;
+    if (!await this.indexWorker({ sessionId, reset: true })) return false;
+    // Any list may be replaced meanwhile, and a newer post of a source may
+    // carry an older list: post until the worker holds the current lists,
+    // each from this rebuild's own post.
+    const posted: Partial<Record<SearchIndexSource, { list: unknown[]; post?: SourcePost }>> = {};
+    let channels: Channel[];
+    let channelsComplete = false;
+    let changed: boolean;
+    do {
+      changed = false;
+      const current = PlaylistService.channels;
+      const programs = this.programIndex;
+      const movies = this.allVod;
+      const series = this.allSeries;
+      channels = current;
+      channelsComplete = PlaylistService.complete;
+      const sources: Array<[SearchIndexSource, unknown[], (index: number) => string[] | string]> = [
+        ['channels', current, index => channelDocument(current[index])],
+        ['programmes', programs, index => programDocument(programs[index])],
+        ['movies', movies, index => movies[index].name],
+        ['series', series, index => series[index].name],
+      ];
+      for (const [source, list, documentAt] of sources) {
+        const last = posted[source];
+        if (last && last.list === list && last.post === this.sourcePosts[source]) continue;
+        changed = true;
+        if (isRecordList(list)) {
+          // The worker reads the record again, or a fallback posts the loaded
+          // list; either way the list it adopted is what it now holds.
+          if (!await this.indexCatalog(sessionId, source === 'movies', source === 'series')
+            || sessionId !== this.workerSession) return false;
+          posted[source] = {
+            list: source === 'movies' ? this.indexedVod : this.indexedSeries,
+            post: this.sourcePosts[source],
+          };
+          continue;
+        }
+        const result = this.postSource(sessionId, source, list.length, documentAt);
+        const post = this.sourcePosts[source];
+        if (!await result || sessionId !== this.workerSession) return false;
+        posted[source] = { list, post };
+        if (this.sourcePosts[source] !== post) continue;
+        if (source === 'movies') this.indexedVod = movies;
+        if (source === 'series') this.indexedSeries = series;
+      }
+    } while (changed);
+    // A post lost meanwhile left its source changed, so the loop reposted it.
+    this.workerIndexLost = false;
+    this.recoveryRetry = null;
+    this.workerChannels = channels;
+    this.workerChannelsComplete = channelsComplete;
+    this.markWorkerIndexReady(this.account);
+    return true;
+  }
+
+  private applyQueryResponse(
+    response: SearchQueryResponse,
+    vod: VodItem[],
+    series: SeriesItem[],
+  ): void {
+    this.visibleChannels = itemsAt(PlaylistService.channels, response.channels.indices);
+    this.visiblePrograms = itemsAt(this.programIndex, response.programmes.indices);
+    // An answer from another epoch indexes items this page no longer keeps.
+    const kept = response.items?.epoch === this.delivered.epoch ? this.delivered : null;
+    this.visibleMovies = isRecordList(vod)
+      ? (kept ? keptAt(kept.movies, response.movies.indices) : [])
+      : itemsAt(vod, response.movies.indices);
+    this.visibleSeries = isRecordList(series)
+      ? (kept ? keptAt(kept.series, response.series.indices) : [])
+      : itemsAt(series, response.series.indices);
+  }
+
+  private clearResults(): void {
+    this.catalogQuery = null;
+    this.visibleChannels = [];
+    this.visiblePrograms = [];
+    this.visibleMovies = [];
+    this.visibleSeries = [];
+    this.queryPending = false;
+    this.resetVirtualOffsets();
+  }
+
+  private canReuseWorkerIndex(account: PlaylistEntry | null): boolean {
+    return this.workerIndexReady
+      && !this.workerIndexLost
+      && this.workerIndexedChannels === PlaylistService.channels
+      && this.workerIndexedChannelsComplete
+      && PlaylistService.complete
+      && this.workerIndexedGuideRevision === EpgService.guideRevision
+      && this.workerIndexedAccountId === (account?.id ?? null)
+      && (!account
+        || (this.loadedFor === account.id
+          && this.workerIndexedVod === this.allVod
+          && this.workerIndexedSeries === this.allSeries));
+  }
+
+  private markWorkerIndexReady(account: PlaylistEntry | null): void {
+    this.workerIndexReady = true;
+    // What the worker holds: the channels posted and the guide data the
+    // posted program index was built from, which can trail the services'.
+    this.workerIndexedChannels = this.workerChannels;
+    this.workerIndexedChannelsComplete = this.workerChannelsComplete;
+    this.workerIndexedGuideRevision = this.indexedChannels === this.workerChannels
+      ? this.indexedGuideRevision
+      : null;
+    this.workerIndexedAccountId = account?.id ?? null;
+    this.workerIndexedGeneration = this.workerResetGeneration;
+    // What the worker holds, which trails allVod/allSeries while a refresh posts.
+    this.workerIndexedVod = this.indexedVod;
+    this.workerIndexedSeries = this.indexedSeries;
+    log.info(
+      'Search worker index ready',
+      'event=search.worker.index.ready',
+      'scope=unified',
+      `session=${String(this.workerSession)}`,
+      `channels=${String(PlaylistService.channels.length)}`,
+      `programmes=${String(this.programIndex.length)}`,
+      `movies=${String(this.allVod.length)}`,
+      `series=${String(this.allSeries.length)}`,
+    );
+  }
+
+  private invalidateWorkerIndex(): void {
+    const wasReady = this.workerIndexReady;
+    this.workerIndexReady = false;
+    this.workerIndexedChannels = null;
+    this.workerIndexedChannelsComplete = false;
+    this.workerIndexedGuideRevision = null;
+    this.workerIndexedAccountId = null;
+    this.workerIndexedGeneration = null;
+    this.workerIndexedVod = null;
+    this.workerIndexedSeries = null;
+    if (wasReady) {
+      log.debug(
+        'Search worker index invalidated',
+        'event=search.worker.index.released',
+        'scope=unified',
+        `session=${String(this.workerSession)}`,
+      );
+    }
+  }
+
+  private programRow(result: ProgramResult, index: number): ReturnType<typeof html> {
+    const { channel, programme } = result;
+    const now = Date.now();
+    const state = programme.stop.getTime() <= now ? 'past' : programme.start.getTime() > now ? 'future' : 'live';
+    const day = formatDayLabel(programme.start);
+    const action = state === 'live'
+      ? t('search.liveNow')
+      : state === 'future'
+        ? (ReminderService.has(channelKey(channel), programme.start.getTime()) ? t('search.reminderSet') : t('search.setReminder'))
+        : XtreamArchiveService.isAvailable(channel, programme.start.getTime(), Date.now(), programme.catchupId) ? t('search.catchUp') : t('search.openChannel');
+    return html`
+      <div class="search-program-row state-${state}" data-focusable
+           data-key="p:${String(result.channelIndex)}:${String(programme.start.getTime())}"
+           data-program-index="${String(index)}">
+        <div class="search-program-time">${day.weekday} ${day.date}<br>${formatTime(programme.start)}</div>
+        <div class="search-program-body">
+          <div class="search-program-title">${programme.title}</div>
+          <div class="search-program-channel">${channel.name}${programme.category ? html` · ${programme.category}` : ''}</div>
+        </div>
+        <div class="search-program-action">${action}</div>
+      </div>
+    `;
+  }
+
+  private async activateProgram(index: number, query: string): Promise<void> {
+    const result = this.visiblePrograms[index];
+    if (!result) return;
+    const { channel, programme } = result;
+    const now = Date.now();
+    if (programme.start.getTime() > now) {
+      const key = channelKey(channel);
+      const startMs = programme.start.getTime();
+      if (ReminderService.has(key, startMs)) {
+        ReminderService.remove(key, startMs);
+        showToast(t('epg.reminderRemoved'));
+      } else {
+        ReminderService.add({
+          channelKey: key,
+          channelName: channel.name,
+          playlistIds: channel.playlistIds.slice(),
+          epgSourceUrl: EpgService.getSourceUrl(channel) ?? undefined,
+          title: programme.title,
+          startMs,
+          stopMs: programme.stop.getTime(),
+        });
+        showToast(t('epg.reminderSet'));
+      }
+      this.render();
+      return;
+    }
+
+    // A stream id alone, kept for every Xtream channel, is no catch-up.
+    if (programme.stop.getTime() <= now && channel.catchupAccountId && channel.catchupStreamId
+      && hasCatchup(channel) && (!!programme.catchupId || !catchupNeedsId(channel))) {
+      await XtreamArchiveService.load(channel);
+      if (!XtreamArchiveService.isAvailable(channel, programme.start.getTime(), Date.now(), programme.catchupId)) {
+        showToast(t('epg.catchupUnavailable'));
+        this.render();
+        return;
+      }
+    }
+
+    if (programme.stop.getTime() <= now &&
+        XtreamArchiveService.isAvailable(channel, programme.start.getTime(), Date.now(), programme.catchupId)) {
+      const key = channelKey(channel);
+      const startMs = programme.start.getTime();
+      const progress = StorageService.getCatchupProgressList(key)
+        .find(entry => entry.progStart === startMs && !entry.completed);
+      if (progress) {
+        this.resumePrompt.show(programme.title, progress.position, {
+          onResume: () => this.playProgram(result, query, progress.position),
+          onStartOver: () => {
+            StorageService.clearCatchupProgress(key, startMs);
+            this.playProgram(result, query);
+          },
+          onCancel: () => { /* keep Search open */ },
+        });
+        return;
+      }
+    }
+    this.playProgram(result, query);
+  }
+
+  private playProgram(result: ProgramResult, query: string, resumeSecs?: number): void {
+    const { channel, channelIndex, programme } = result;
+    rememberQuery(query, liveParentalRequest(channel));
+    let catchup: CatchupInfo | undefined;
+    if (programme.stop.getTime() <= Date.now() &&
+        XtreamArchiveService.isAvailable(channel, programme.start.getTime(), Date.now(), programme.catchupId)) {
+      catchup = {
+        start: Math.floor(programme.start.getTime() / 1000),
+        end: Math.floor(programme.stop.getTime() / 1000),
+        title: programme.title,
+        description: programme.description,
+        icon: programme.icon,
+        ...(programme.catchupId ? { catchupId: programme.catchupId } : {}),
+        epgSourceUrl: EpgService.getSourceUrl(channel) ?? undefined,
+        resumeSecs,
+      };
+    }
+    this.handlers.onPlayChannel(channelIndex, catchup);
+  }
+
+  private render(): void {
+    const q = this.query.trim();
+    const hasResults = this.visibleChannels.length > 0 || this.visiblePrograms.length > 0
+      || this.visibleMovies.length > 0 || this.visibleSeries.length > 0;
+    const programSection = this.visiblePrograms.length
+      ? this.virtualList(
+          t('search.programs'),
+          'programmes',
+          this.visiblePrograms,
+          this.programVirtualizer,
+          (result, index) => this.programRow(result, index),
+        )
+      : '';
+
+    // Channels, movies, and series are horizontal tile rails; EPG programs use
+    // compact rows so their metadata remains readable.
+    const partial = this.partialIndex();
+    const moreComing = partial || this.channelsArriving();
+    const resultsBody = !q
+      ? html``
+      : this.pendingIndex && (!partial || (!hasResults && !this.queryPending))
+        ? html`<p class="catalog-hint search-empty">${t('search.preparing')}</p>`
+      : this.queryPending
+        ? html``
+        : !hasResults && this.channelsArriving()
+        ? html`<p class="catalog-hint search-loading-more">${t('common.loading')}</p>`
+        : !hasResults
+        ? html`<p class="catalog-hint search-empty">${t('search.empty')}</p>`
+        : html`
+            ${this.visibleChannels.length
+              ? this.virtualRail(
+                  t('common.channels'),
+                  'channels-rail',
+                  this.visibleChannels,
+                  this.channelRailVirtualizer,
+                  (ch) => this.channelTile(ch),
+                )
+              : ''}
+            ${programSection}
+            ${this.visibleMovies.length
+              ? this.virtualRail(
+                  t('common.movies'),
+                  'movies',
+                  this.visibleMovies,
+                  this.movieVirtualizer,
+                  (v) => this.movieTile(v),
+                )
+              : ''}
+            ${this.visibleSeries.length
+              ? this.virtualRail(
+                  t('common.series'),
+                  'series',
+                  this.visibleSeries,
+                  this.seriesVirtualizer,
+                  (s) => this.seriesTile(s),
+                )
+              : ''}
+          `;
+
+    // The query box lives in the tab bar; this view renders results only.
+    morph(this.container, html`
+      <div class="search-view" data-nav-container data-search-query="${q}"
+           data-search-pending="${this.queryPending ? 'true' : 'false'}"
+           data-search-partial="${moreComing ? 'true' : 'false'}">
+        <div class="search-results">${resultsBody}${moreComing && q && hasResults && !this.queryPending
+          ? html`<p class="catalog-hint search-loading-more">${t('common.loading')}</p>`
+          : ''}</div>
+      </div>
+    `);
+    this.restoreVirtualOffsets();
+  }
+
+  private createVirtualizer(
+    itemSize: number,
+    overscan: number,
+    viewport: number,
+  ): VirtualList {
+    return new VirtualList({
+      itemSize,
+      overscan,
+      fallbackViewportSize: viewport,
+    });
+  }
+
+  private virtualizers(): Record<string, VirtualList> {
+    return {
+      programmes: this.programVirtualizer,
+      'channels-rail': this.channelRailVirtualizer,
+      movies: this.movieVirtualizer,
+      series: this.seriesVirtualizer,
+    };
+  }
+
+  private resetVirtualOffsets(): void {
+    const virtualizers = this.virtualizers();
+    Object.keys(virtualizers).forEach(key => virtualizers[key].setScrollOffset(0));
+    this.container.querySelectorAll<HTMLElement>('[data-search-virtual]').forEach((el) => {
+      const axis = el.dataset.searchAxis === 'horizontal' ? 'horizontal' : 'vertical';
+      this.scrollGuard.syncOffset(el, axis, 0);
+    });
+  }
+
+  private restoreVirtualOffsets(): void {
+    const virtualizers = this.virtualizers();
+    Object.keys(virtualizers).forEach((key) => {
+      const el = this.container.querySelector<HTMLElement>(`[data-search-virtual="${key}"]`);
+      if (!el) return;
+      const offset = virtualizers[key].scrollOffset;
+      const axis = el.dataset.searchAxis === 'horizontal' ? 'horizontal' : 'vertical';
+      this.scrollGuard.syncOffset(el, axis, offset);
+    });
+  }
+
+  private onVirtualScroll(event: Event): void {
+    const target = event.target as HTMLElement;
+    const key = target.dataset.searchVirtual;
+    if (!key) return;
+    const virtualizer = this.virtualizers()[key];
+    if (!virtualizer) return;
+    const axis: VirtualScrollAxis = target.dataset.searchAxis === 'horizontal'
+      ? 'horizontal'
+      : 'vertical';
+    const offset = this.scrollGuard.readUserOffset(target, axis);
+    if (offset === null) return;
+    virtualizer.setScrollOffset(offset);
+    if (this.scrollFrame !== null) return;
+    this.scrollFrame = requestAnimationFrame(() => {
+      this.scrollFrame = null;
+      const latest = this.scrollGuard.readUserOffset(target, axis);
+      if (latest !== null) virtualizer.setScrollOffset(latest);
+      if (axis === 'horizontal' && this.railWindows.get(key) === this.railWindow(
+        this.resultCount(key),
+        virtualizer.getRange(this.resultCount(key), target.clientWidth || SEARCH_RAIL_VIEWPORT),
+      )) return;
+      this.render();
+    });
+  }
+
+  private railWindow(count: number, range: { start: number; end: number }): string {
+    return `${String(count)}:${String(range.start)}:${String(range.end)}`;
+  }
+
+  private moveVirtualFocus(action: Action): boolean {
+    const focused = this.nav.focused;
+    // Focus a re-render removed recovers through the nav first.
+    if (!focused || !this.container.contains(focused)) return false;
+    const cell = focused.closest<HTMLElement>('[data-search-section]');
+    const key = cell?.dataset.searchSection;
+    const rawIndex = cell?.dataset.searchIndex;
+    if (!key || rawIndex === undefined) return false;
+    const horizontal = key === 'channels-rail' || key === 'movies' || key === 'series';
+    if ((horizontal && action !== 'left' && action !== 'right')
+        || (!horizontal && action !== 'up' && action !== 'down')) return false;
+    const next = parseInt(rawIndex, 10) + (action === 'left' || action === 'up' ? -1 : 1);
+    if (next < 0 || next >= this.resultCount(key)) return false;
+    const scroll = this.container.querySelector<HTMLElement>(`[data-search-virtual="${key}"]`);
+    const virtualizer = this.virtualizers()[key];
+    virtualizer.ensureVisible(
+      next,
+      horizontal
+        ? this.railContentWidth(scroll)
+        : scroll?.clientHeight || SEARCH_LIST_VIEWPORT,
+    );
+    this.render();
+    this.nav.focus(
+      this.container.querySelector<HTMLElement>(
+        `[data-search-section="${key}"][data-search-index="${next}"] [data-focusable]`,
+      ),
+    );
+    return true;
+  }
+
+  // Item offsets start after the rail's padding, so a tile kept in view
+  // rests on the left keyline and clears the right edge's ring gutter.
+  private railContentWidth(rail: HTMLElement | null): number {
+    if (!rail?.clientWidth) return SEARCH_RAIL_VIEWPORT;
+    const style = getComputedStyle(rail);
+    return rail.clientWidth - (parseFloat(style.paddingLeft) || 0) - (parseFloat(style.paddingRight) || 0);
+  }
+
+  private resultCount(key: string): number {
+    if (key === 'channels-rail') return this.visibleChannels.length;
+    if (key === 'programmes') return this.visiblePrograms.length;
+    if (key === 'movies') return this.visibleMovies.length;
+    return this.visibleSeries.length;
+  }
+
+  private cancelScheduledQuery(): void {
+    this.queryGeneration++;
+    if (this.queryFrame !== null) cancelAnimationFrame(this.queryFrame);
+    this.queryFrame = null;
+  }
+}
+
+function sameLists(before: unknown[], after: unknown[]): boolean {
+  return before.every((list, index) => list === after[index]);
+}
+
+function itemsAt<T>(items: T[], indices: number[]): T[] {
+  const selected: T[] = [];
+  for (const index of indices) {
+    const item = items[index];
+    if (item !== undefined) selected.push(item);
+  }
+  return selected;
+}
+
+function keptAt<T>(items: Map<number, T>, indices: number[]): T[] {
+  const selected: T[] = [];
+  for (const index of indices) {
+    const item = items.get(index);
+    if (item !== undefined) selected.push(item);
+  }
+  return selected;
+}
+
+function indicesOf<T>(items: T[], selected: T[]): number[] {
+  const byItem = new Map<T, number>();
+  for (let index = 0; index < items.length; index++) byItem.set(items[index], index);
+  return selected.map(item => byItem.get(item) ?? -1);
+}
+
+// A query that led to PIN-guarded content stays out of recent searches, which
+// anyone can see once the session is locked again (or the PIN was canceled).
+function rememberQuery(query: string, request: Parameters<typeof ParentalControlService.protects>[0]): void {
+  if (!ParentalControlService.protects(request)) StorageService.addSearchHistory(query);
+}

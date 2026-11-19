@@ -1,0 +1,15 @@
+{
+  "id": "br.com.fidalgo.tv",
+  "version": "1.0.0",
+  "vendor": "fidalGO",
+  "type": "web",
+  "main": "index.html",
+  "title": "fidalGO TV",
+  "appDescription": "fidalGO TV para LG webOS: Canais ao vivo do Brasil, Filmes, Séries e Animes.",
+  "icon": "icon.png",
+  "largeIcon": "largeIcon.png",
+  "iconColor": "#241e52",
+  "resolution": "1920x1080",
+  "disableBackHistoryAPI": true,
+  "transparent": false
+}

@@ -1,0 +1,777 @@
+import { test, expect, routeLiveManifest, neuterVideo, SAMPLE_M3U, enterTab, liveLoaded, endHoldingUpNext } from './helpers';
+import { seedXtream } from './fixtures/xtream';
+
+// Seed one Xtream account (enables the tab bar) and stub the player_api.php
+// series calls + the get.php/xmltv.php the live path uses.
+async function seedSeries(page: import('@playwright/test').Page): Promise<void> {
+  await page.route('**/get.php*', (route) =>
+    route.fulfill({ status: 200, contentType: 'application/x-mpegurl', body: SAMPLE_M3U }));
+  await page.route('**/xmltv.php*', (route) =>
+    route.fulfill({ status: 200, contentType: 'application/xml', body: '<tv></tv>' }));
+  await page.route('**/player_api.php*', (route) => {
+    const url = route.request().url();
+    if (url.includes('get_series_categories')) {
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify([{ category_id: '1', category_name: 'Cat A' }]) });
+    }
+    if (url.includes('get_series_info')) {
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+        episodes: { '1': [
+          { id: 10, title: 'Episode One', season: 1, episode_num: 1, container_extension: 'mp4', info: { plot: 'Ep plot.', duration_secs: 1500, movie_image: '' } },
+        ] },
+      }) });
+    }
+    if (url.includes('get_series')) {
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify([
+        { series_id: 1, name: 'Series One', cover: '', category_id: '1' },
+      ]) });
+    }
+    return route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
+  });
+  // The episode file itself: a small response so play() doesn't hang the test.
+  await page.route('**/series/**', (route) =>
+    route.fulfill({ status: 200, contentType: 'video/mp4', body: '' }));
+  await page.addInitScript(() => {
+    localStorage.setItem('iptv_playlists', JSON.stringify([
+      { id: 'x1', name: 'X Account', url: 'http://host.example.com:8080',
+        source: 'xtream', xtream: { username: 'u', password: 'p' } },
+    ]));
+  });
+}
+
+test('Continue Watching updates the hero from saved episodes by pointer and remote without loading details', async ({ page }) => {
+  await seedSeries(page);
+  const details: string[] = [];
+  page.on('request', request => {
+    if (request.url().includes('action=get_series_info')) details.push(request.url());
+  });
+  await page.route('http://host/hero/**', route => route.fulfill({
+    contentType: 'image/svg+xml',
+    body: '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><rect width="24" height="24" fill="#468"/></svg>',
+  }));
+  await page.addInitScript(() => {
+    const resume: Record<string, unknown> = {};
+    for (const n of [1, 2]) {
+      resume[`x1|episode|e${n}`] = {
+        accountId: 'x1', kind: 'episode', itemId: `e${n}`, name: `Episode ${n}`,
+        poster: `http://host/hero/${n}.svg`, ext: 'mp4',
+        position: 100, duration: 600, updatedAt: 3 - n,
+      };
+    }
+    localStorage.setItem('iptv_resume', JSON.stringify(resume));
+  });
+  await page.goto('/');
+  await enterTab(page, 'series');
+  const view = page.locator('#view-series');
+  const hero = view.locator('.catalog-hero');
+  const first = view.locator('[data-resume-episode="e1"]');
+  const second = view.locator('[data-resume-episode="e2"]');
+  await first.hover();
+  await expect(view.locator('.catalog-hero-title')).toHaveText('Episode 1');
+  await expect(hero).toHaveCSS('background-image', /\/hero\/1\.svg/);
+  await second.hover();
+  await expect(view.locator('.catalog-hero-title')).toHaveText('Episode 2');
+  await expect(hero).toHaveCSS('background-image', /\/hero\/2\.svg/);
+  await page.keyboard.press('ArrowLeft');
+  await expect(first).toHaveClass(/focused/);
+  await expect(view.locator('.catalog-hero-title')).toHaveText('Episode 1');
+  await expect(hero).toHaveCSS('background-image', /\/hero\/1\.svg/);
+  expect(details).toEqual([]);
+});
+
+test('Left from a round action whose name is open reaches Resume, not the season row below', async ({ page }) => {
+  await seedSeries(page);
+  await page.route('**/player_api.php*action=get_series_info*', (route) => route.fulfill({
+    status: 200, contentType: 'application/json', body: JSON.stringify({
+      episodes: {
+        '1': [{ id: 10, title: 'Episode One', season: 1, episode_num: 1, container_extension: 'mp4', info: { duration_secs: 1500 } }],
+        '2': [{ id: 20, title: 'Episode Two', season: 2, episode_num: 1, container_extension: 'mp4', info: { duration_secs: 1500 } }],
+      },
+    }),
+  }));
+  await page.addInitScript(() => {
+    localStorage.setItem('iptv_resume', JSON.stringify({ 'x1|episode|10': {
+      accountId: 'x1', kind: 'episode', itemId: '10', name: 'Series One — S1E1', poster: '', ext: 'mp4',
+      categoryId: '1', position: 100, duration: 600, updatedAt: 1,
+      watchlistOwner: { kind: 'series', itemId: '1', name: 'Series One', poster: '' },
+    } }));
+  });
+  await page.goto('/');
+  await enterTab(page, 'series');
+  const view = page.locator('#view-series');
+  const tile = view.locator('[data-rail-key="continue"] .catalog-tile');
+  await tile.evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  await page.keyboard.press('Enter');
+  await expect(view.locator('[data-season="2"]')).toBeVisible();
+  const resume = view.locator('[data-action="resume"]');
+  await expect(resume).toHaveClass(/focused/);
+  await page.keyboard.press('ArrowRight');
+  await expect(view.locator('[data-action="watchlist"]')).toHaveClass(/focused/);
+  await page.keyboard.press('ArrowLeft');
+  await expect(resume).toHaveClass(/focused/);
+});
+
+test('Down from Resume or a round action reaches the seasons, not the episodes past them', async ({ page }) => {
+  await seedSeries(page);
+  await page.route('**/player_api.php*action=get_series_info*', (route) => route.fulfill({
+    status: 200, contentType: 'application/json', body: JSON.stringify({
+      episodes: {
+        '1': [{ id: 10, title: 'Episode One', season: 1, episode_num: 1, container_extension: 'mp4', info: { duration_secs: 1500 } }],
+        '2': [{ id: 20, title: 'Episode Two', season: 2, episode_num: 1, container_extension: 'mp4', info: { duration_secs: 1500 } }],
+      },
+    }),
+  }));
+  await page.addInitScript(() => {
+    localStorage.setItem('iptv_resume', JSON.stringify({ 'x1|episode|10': {
+      accountId: 'x1', kind: 'episode', itemId: '10', name: 'Series One — S1E1', poster: '', ext: 'mp4',
+      categoryId: '1', position: 100, duration: 600, updatedAt: 1,
+      watchlistOwner: { kind: 'series', itemId: '1', name: 'Series One', poster: '' },
+    } }));
+  });
+  await page.goto('/');
+  await enterTab(page, 'series');
+  const view = page.locator('#view-series');
+  const tile = view.locator('[data-rail-key="continue"] .catalog-tile');
+  await tile.evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  await page.keyboard.press('Enter');
+  await expect(view.locator('[data-season="2"]')).toBeVisible();
+  const resume = view.locator('[data-action="resume"]');
+  await expect(resume).toHaveClass(/focused/);
+  const season = view.locator('.series-seasons [data-season].focused');
+  await page.keyboard.press('ArrowDown');
+  await expect(season).toHaveCount(1);
+  await page.keyboard.press('ArrowUp');
+  await expect(resume).toHaveClass(/focused/);
+  await page.keyboard.press('ArrowRight');
+  await expect(view.locator('[data-action="watchlist"]')).toHaveClass(/focused/);
+  await page.keyboard.press('ArrowDown');
+  await expect(season).toHaveCount(1);
+});
+
+test('the season mark\'s name opens whole beside many seasons, its row wrapping instead', async ({ page }) => {
+  await seedSeries(page);
+  const episodes: Record<string, unknown[]> = {};
+  for (let season = 1; season <= 6; season++) {
+    episodes[String(season)] = [{ id: season * 10, title: `Episode ${season}`, season, episode_num: 1,
+      container_extension: 'mp4', info: { duration_secs: 1500 } }];
+  }
+  await page.route('**/player_api.php*action=get_series_info*', (route) => route.fulfill({
+    status: 200, contentType: 'application/json', body: JSON.stringify({ episodes }),
+  }));
+  await page.addInitScript(() => localStorage.setItem('iptv_animation_mode', JSON.stringify('essential')));
+  await page.goto('/');
+  await enterTab(page, 'series');
+  const view = page.locator('#view-series');
+  const tile = view.locator('.catalog-tile[data-item-id="1"]').first();
+  await tile.evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  await page.keyboard.press('Enter');
+  await expect(view.locator('[data-season="6"]')).toBeVisible();
+  const mark = view.locator('[data-action="season-watched"]');
+  // Too little room is left beside the last season, so the mark wraps to a line
+  // of its own, reached from the season straight above it.
+  await view.locator('[data-season="1"]').evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  for (let i = 0; i < 3 && !await mark.evaluate((el) => el.classList.contains('focused')); i++) {
+    await page.keyboard.press('ArrowDown');
+  }
+  await expect(mark).toHaveClass(/focused/);
+  const label = await mark.locator('.detail-icon-label').evaluate((el) => ({
+    cut: el.scrollWidth > el.clientWidth + 1, width: el.clientWidth,
+  }));
+  expect(label.width).toBeGreaterThan(100);
+  expect(label.cut).toBe(false);
+});
+
+// Resumed, so a wide Resume pushes the round actions over the episodes' marks.
+async function openResumedTwoSeasons(page: import('@playwright/test').Page) {
+  await seedSeries(page);
+  await page.route('**/player_api.php*action=get_series_info*', (route) => route.fulfill({
+    status: 200, contentType: 'application/json', body: JSON.stringify({
+      episodes: {
+        '1': [{ id: 10, title: 'Episode One', season: 1, episode_num: 1, container_extension: 'mp4', info: { duration_secs: 1500 } }],
+        '2': [{ id: 20, title: 'Episode Two', season: 2, episode_num: 1, container_extension: 'mp4', info: { duration_secs: 1500 } }],
+      },
+    }),
+  }));
+  await page.addInitScript(() => {
+    localStorage.setItem('iptv_animation_mode', JSON.stringify('essential'));
+    localStorage.setItem('iptv_resume', JSON.stringify({ 'x1|episode|10': {
+      accountId: 'x1', kind: 'episode', itemId: '10', name: 'Series One — S1E1', poster: '', ext: 'mp4',
+      categoryId: '1', position: 100, duration: 600, updatedAt: 1, season: 1, episode: 1,
+      watchlistOwner: { kind: 'series', itemId: '1', name: 'Series One', poster: '' },
+    } }));
+  });
+  await page.goto('/');
+  await enterTab(page, 'series');
+  const view = page.locator('#view-series');
+  await view.locator('[data-rail-key="continue"] .catalog-tile')
+    .evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  await page.keyboard.press('Enter');
+  await expect(view.locator('[data-season="2"]')).toBeVisible();
+  await expect(view.locator('[data-action="resume"]')).toHaveClass(/focused/);
+  return view;
+}
+
+const keyTo = async (page: import('@playwright/test').Page, key: string, target: import('@playwright/test').Locator) => {
+  await page.keyboard.press(key);
+  await expect(target).toHaveClass(/\bfocused\b/);
+};
+
+test('Up from the first episode or its mark lands on the season shown, past the actions above', async ({ page }) => {
+  const view = await openResumedTwoSeasons(page);
+  const season1 = view.locator('[data-season="1"]');
+  await keyTo(page, 'ArrowDown', season1);
+  await keyTo(page, 'ArrowRight', view.locator('[data-season="2"]'));
+  await page.keyboard.press('Enter');
+  await expect(view.locator('[data-season="2"].active')).toBeVisible();
+  await keyTo(page, 'ArrowDown', view.locator('.episode-row[data-episode-id="20"]'));
+  await keyTo(page, 'ArrowRight', view.locator('[data-episode-mark="20"]'));
+  await keyTo(page, 'ArrowUp', view.locator('[data-season="2"]'));
+  await keyTo(page, 'ArrowDown', view.locator('[data-episode-mark="20"]'));
+  await keyTo(page, 'ArrowLeft', view.locator('.episode-row[data-episode-id="20"]'));
+  await keyTo(page, 'ArrowUp', view.locator('[data-season="2"]'));
+});
+
+test('Left from Resume stays put, and Right goes on to the round actions', async ({ page }) => {
+  const view = await openResumedTwoSeasons(page);
+  const resume = view.locator('[data-action="resume"]');
+  await page.keyboard.press('ArrowLeft');
+  await expect(resume).toHaveClass(/\bfocused\b/);
+  await keyTo(page, 'ArrowRight', view.locator('[data-action="watchlist"]'));
+});
+
+test('the season row ends where it ends: Right from its last control stays put', async ({ page }) => {
+  const view = await openResumedTwoSeasons(page);
+  const mark = view.locator('[data-action="season-watched"]');
+  await keyTo(page, 'ArrowDown', view.locator('[data-season="1"]'));
+  await keyTo(page, 'ArrowRight', view.locator('[data-season="2"]'));
+  await keyTo(page, 'ArrowRight', mark);
+  await page.keyboard.press('ArrowRight');
+  await expect(mark).toHaveClass(/\bfocused\b/);
+});
+
+test('Down into the seasons and back Up returns to the round action it left', async ({ page }) => {
+  const view = await openResumedTwoSeasons(page);
+  const hide = view.locator('[data-action="hide"]');
+  await keyTo(page, 'ArrowRight', view.locator('[data-action="watchlist"]'));
+  await keyTo(page, 'ArrowRight', view.locator('[data-action="watched"]'));
+  await keyTo(page, 'ArrowRight', hide);
+  await page.keyboard.press('ArrowDown');
+  await expect(view.locator('.series-seasons .focused')).toHaveCount(1);
+  await keyTo(page, 'ArrowUp', hide);
+});
+
+test('a wrapped season row keeps Left and Right on each line and stops at its ends', async ({ page }) => {
+  await seedSeries(page);
+  const episodes: Record<string, unknown[]> = {};
+  for (let season = 1; season <= 12; season++) {
+    episodes[String(season)] = [10, 11, 12].map((n) => ({ id: season * 100 + n, title: `Episode ${n}`, season,
+      episode_num: n - 9, container_extension: 'mp4', info: { duration_secs: 1500 } }));
+  }
+  await page.route('**/player_api.php*action=get_series_info*', (route) => route.fulfill({
+    status: 200, contentType: 'application/json', body: JSON.stringify({ episodes }),
+  }));
+  await page.addInitScript(() => localStorage.setItem('iptv_animation_mode', JSON.stringify('essential')));
+  await page.goto('/');
+  await enterTab(page, 'series');
+  const view = page.locator('#view-series');
+  await view.locator('.catalog-tile[data-item-id="1"]').first()
+    .evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  await page.keyboard.press('Enter');
+  await expect(view.locator('[data-season="12"]')).toBeVisible();
+  const season = (n: number) => view.locator(`[data-season="${n}"]`);
+  const lineOf = (n: number) => season(n).evaluate((el) => Math.round(el.getBoundingClientRect().top));
+  expect(await lineOf(12)).toBeGreaterThan(await lineOf(1));
+  // The last season on the first line, and the first one on the second.
+  let lastOnFirst = 1;
+  while (lastOnFirst < 12 && await lineOf(lastOnFirst + 1) === await lineOf(1)) lastOnFirst++;
+  await season(1).evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  await keyTo(page, 'ArrowRight', season(2));
+  await keyTo(page, 'ArrowLeft', season(1));
+  await page.keyboard.press('ArrowLeft');
+  await expect(season(1)).toHaveClass(/\bfocused\b/);
+  for (let n = 2; n <= lastOnFirst; n++) await keyTo(page, 'ArrowRight', season(n));
+  await page.keyboard.press('ArrowRight');
+  await expect(season(lastOnFirst)).toHaveClass(/\bfocused\b/);
+  // Down into the episodes, then Left on a row stays in the list.
+  await keyTo(page, 'ArrowLeft', season(lastOnFirst - 1));
+  // The season mark wrapped alone below is a line of its own: Down from the
+  // last season line reaches it, and Down again goes on to the episodes.
+  const mark = view.locator('[data-action="season-watched"]');
+  const markTop = await mark.evaluate((el) => Math.round(el.getBoundingClientRect().top));
+  expect(markTop).toBeGreaterThan(await lineOf(12));
+  await season(12).evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  for (let i = 0; i < 2 && !await season(12).evaluate((el) => el.classList.contains('focused')); i++) {
+    await page.keyboard.press('ArrowRight');
+  }
+  await keyTo(page, 'ArrowDown', mark);
+  await page.keyboard.press('ArrowDown');
+  await expect(view.locator('.series-episodes .focused')).toHaveCount(1);
+  await season(lastOnFirst + 1).evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  for (let i = 0; i < 2 && !await mark.evaluate((el) => el.classList.contains('focused')); i++) {
+    await page.keyboard.press('ArrowDown');
+  }
+  await expect(mark).toHaveClass(/\bfocused\b/);
+  const row = view.locator('.episode-row[data-episode-id="110"]');
+  await season(1).evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  await page.keyboard.press('ArrowDown');
+  for (let i = 0; i < 4 && !await row.evaluate((el) => el.classList.contains('focused')); i++) {
+    await page.keyboard.press('ArrowDown');
+  }
+  await expect(row).toHaveClass(/\bfocused\b/);
+  await page.keyboard.press('ArrowLeft');
+  await expect(row).toHaveClass(/\bfocused\b/);
+});
+
+test('Down from a season reaches the first episode even after the list scrolled it away', async ({ page }) => {
+  await seedSeries(page);
+  const episodes: Record<string, unknown[]> = {};
+  for (const season of [1, 2]) {
+    episodes[String(season)] = Array.from({ length: 80 }, (_, i) => ({ id: season * 1000 + i + 1, title: `Episode ${i + 1}`,
+      season, episode_num: i + 1, container_extension: 'mp4', info: { duration_secs: 1500 } }));
+  }
+  await page.route('**/player_api.php*action=get_series_info*', (route) => route.fulfill({
+    status: 200, contentType: 'application/json', body: JSON.stringify({ episodes }),
+  }));
+  await page.addInitScript(() => localStorage.setItem('iptv_animation_mode', JSON.stringify('essential')));
+  await page.goto('/');
+  await enterTab(page, 'series');
+  const view = page.locator('#view-series');
+  await view.locator('.catalog-tile[data-item-id="1"]').first()
+    .evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  await page.keyboard.press('Enter');
+  const season = view.locator('[data-season="1"]');
+  await expect(season).toBeVisible();
+  await season.evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  await expect(season).toHaveClass(/\bfocused\b/);
+  // The wheel scrolls the list on while the pointer rests on nothing.
+  await view.locator('.series-detail').evaluate((el) => { el.scrollTop = 4000; el.dispatchEvent(new Event('scroll')); });
+  await expect(view.locator('[data-episode-index="0"]')).toHaveCount(0);
+  await keyTo(page, 'ArrowDown', view.locator('.episode-row[data-episode-id="1001"]'));
+  await keyTo(page, 'ArrowUp', season);
+});
+
+test('Down from a season not shown, then Up, returns to that season', async ({ page }) => {
+  const view = await openResumedTwoSeasons(page);
+  await keyTo(page, 'ArrowDown', view.locator('[data-season="1"]'));
+  await keyTo(page, 'ArrowRight', view.locator('[data-season="2"]'));
+  await keyTo(page, 'ArrowDown', view.locator('.episode-row[data-episode-id="10"]'));
+  await keyTo(page, 'ArrowUp', view.locator('[data-season="2"]'));
+});
+
+test('a Continue Watching series opens its detail on Resume, and Back returns there', async ({ page }) => {
+  await seedSeries(page);
+  await neuterVideo(page);
+  await page.addInitScript(() => {
+    const resume: Record<string, unknown> = {};
+    for (const [itemId, label, updatedAt] of [['10', 'S1E1 — Episode One', 2], ['9', 'S1E0', 1]] as const) {
+      resume[`x1|episode|${itemId}`] = {
+        accountId: 'x1', kind: 'episode', itemId, name: `Series One — ${label}`, poster: '', ext: 'mp4',
+        categoryId: '1', position: 100, duration: 600, updatedAt,
+        watchlistOwner: { kind: 'series', itemId: '1', name: 'Series One', poster: '' },
+      };
+    }
+    localStorage.setItem('iptv_resume', JSON.stringify(resume));
+  });
+  await page.goto('/');
+  await enterTab(page, 'series');
+  const view = page.locator('#view-series');
+  const tile = view.locator('[data-rail-key="continue"] .catalog-tile');
+  await expect(tile).toHaveCount(1);
+  await expect(tile.locator('.catalog-tile-name')).toHaveText('Series One');
+  await expect(tile.locator('.catalog-tile-sub')).toHaveText('S1 E1');
+  await tile.evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  await page.keyboard.press('Enter');
+
+  const resume = view.locator('[data-action="resume"]');
+  await expect(resume).toHaveClass(/focused/);
+  await expect(resume).toContainText('S1 E1');
+  await page.keyboard.press('Enter');
+  await expect(page.locator('#view-player')).toBeVisible();
+  await page.evaluate(() => document.dispatchEvent(new KeyboardEvent('keydown', { keyCode: 461, bubbles: true })));
+  await expect(view.locator('.series-detail')).toBeVisible();
+  await expect(resume).toHaveClass(/focused/);
+  await page.evaluate(() => document.dispatchEvent(new KeyboardEvent('keydown', { keyCode: 461, bubbles: true })));
+  await expect(tile).toHaveClass(/focused/);
+});
+
+test('stepping right along Continue Watching keeps a series\' stacked cards in view', async ({ page }) => {
+  await seedSeries(page);
+  await page.addInitScript(() => {
+    const resume: Record<string, unknown> = {};
+    for (let i = 0; i < 12; i++) {
+      resume[`x1|episode|e${i}`] = {
+        accountId: 'x1', kind: 'episode', itemId: `e${i}`, name: `Series ${i} — S1E1`, poster: '', ext: 'mp4',
+        position: 100, duration: 600, updatedAt: 20 - i, season: 1, episode: 1,
+        watchlistOwner: { kind: 'series', itemId: `s${i}`, name: `Series ${i}`, poster: '' },
+      };
+    }
+    localStorage.setItem('iptv_resume', JSON.stringify(resume));
+  });
+  await page.goto('/');
+  await enterTab(page, 'series');
+  const track = page.locator('#view-series [data-rail-key="continue"] .catalog-rail-track');
+  const tiles = track.locator('.catalog-tile-stack');
+  await tiles.first().evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  await page.keyboard.press('ArrowRight');
+  for (let i = 1; i < 8; i++) {
+    await page.keyboard.press('ArrowRight');
+    await expect(tiles.nth(i + 1)).toHaveClass(/focused/);
+  }
+  await expect.poll(() => track.evaluate((el) => {
+    const tile = el.querySelector<HTMLElement>('.catalog-tile.focused')!;
+    const back = parseFloat(getComputedStyle(tile, '::after').width);
+    return el.getBoundingClientRect().right - (tile.getBoundingClientRect().left + back);
+  })).toBeGreaterThanOrEqual(0);
+});
+
+// Three episodes, optionally with stills, so the middle one has a skip live on
+// each side and Up Next has a next episode to show.
+async function routeThreeEpisodes(page: import('@playwright/test').Page, stills = false): Promise<void> {
+  await page.route('**/player_api.php*action=get_series_info*', (route) => route.fulfill({
+    status: 200, contentType: 'application/json', body: JSON.stringify({
+      episodes: { '1': [1, 2, 3].map((n) => ({
+        id: 10 + n, title: `Episode ${n}`, season: 1, episode_num: n, container_extension: 'mp4',
+        info: { plot: '', duration_secs: 1500, movie_image: stills ? `http://host/still/${n}.svg` : '' },
+      })) },
+    }),
+  }));
+  await page.route('http://host/still/**', (route) => route.fulfill({
+    contentType: 'image/svg+xml',
+    body: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="9"><rect width="16" height="9" fill="#468"/></svg>',
+  }));
+}
+
+async function playSecondEpisode(page: import('@playwright/test').Page): Promise<void> {
+  await enterTab(page, 'series');
+  await page.locator('.catalog-tile[data-item-id="1"]')
+    .evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  await page.keyboard.press('Enter');
+  await page.locator('.episode-row[data-episode-id="12"]')
+    .evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  await page.keyboard.press('Enter');
+}
+
+const rect = (el: Element) => {
+  const r = el.getBoundingClientRect();
+  return { left: Math.round(r.left), right: Math.round(r.right), top: Math.round(r.top),
+    bottom: Math.round(r.bottom), width: Math.round(r.width), height: Math.round(r.height) };
+};
+
+test('CH+ and CH- step through a series\' episodes, as the OSD skips do', async ({ page }) => {
+  await seedSeries(page);
+  await neuterVideo(page);
+  await routeThreeEpisodes(page);
+  await page.goto('/');
+  await playSecondEpisode(page);
+
+  const osd = page.locator('#player-osd');
+  const title = osd.locator('.osd-vod-detail');
+  const previous = osd.locator('[data-skip-episode="-1"]');
+  const next = osd.locator('[data-skip-episode="1"]');
+  const playPause = osd.locator('[data-playpause]');
+  await expect(title).toContainText('S1 E2');
+  await expect(previous).toBeEnabled();
+  await expect(next).toBeEnabled();
+  // The skips sit a row gap either side of play/pause, which never moves.
+  const [before, middle, after] = await Promise.all([previous, playPause, next].map((l) => l.evaluate(rect)));
+  expect(middle.left - before.right).toBe(12);
+  expect(after.left - middle.right).toBe(12);
+
+  await page.keyboard.press('PageUp');
+  await expect(title).toContainText('S1 E3');
+  await expect(next).toBeDisabled();
+  expect((await playPause.evaluate(rect)).left).toBe(middle.left);
+  await page.keyboard.press('PageDown');
+  await page.keyboard.press('PageDown');
+  await expect(title).toContainText('S1 E1');
+  await expect(previous).toBeDisabled();
+  expect((await playPause.evaluate(rect)).left).toBe(middle.left);
+  await next.click();
+  await expect(title).toContainText('S1 E2');
+});
+
+test('Up Next sets the next episode\'s still beside its text and spaces its actions', async ({ page }) => {
+  await seedSeries(page);
+  await neuterVideo(page);
+  await routeThreeEpisodes(page, true);
+  await page.goto('/');
+  await playSecondEpisode(page);
+  await expect(page.locator('#player-osd .osd-vod-detail')).toContainText('S1 E2');
+
+  await endHoldingUpNext(page);
+  const card = page.locator('#player-osd .osd-next-episode');
+  await expect(card).toContainText('S1 E3');
+  const thumb = card.locator('.osd-next-episode-thumb');
+  await expect.poll(() => thumb.evaluate((img) => (img as HTMLImageElement).complete)).toBe(true);
+
+  const still = await thumb.evaluate(rect);
+  const body = await card.locator('.osd-next-episode-body').evaluate(rect);
+  expect([still.width, still.height]).toEqual([384, 216]);
+  expect(body.left - still.right).toBe(24);
+  expect(Math.abs((body.top + body.bottom) - (still.top + still.bottom))).toBeLessThanOrEqual(2);
+
+  const [playNow, cancel] = await card.locator('.osd-next-episode-actions button').evaluateAll((buttons) =>
+    buttons.map((b) => { const r = b.getBoundingClientRect(); return { left: r.left, right: r.right, top: r.top }; }));
+  expect(Math.round(cancel.left - playNow.right)).toBe(12);
+  expect(cancel.top).toBe(playNow.top);
+  const icon = await card.locator('[data-next-play] .osd-next-episode-icon').evaluate(rect);
+  const label = await card.locator('[data-next-play] > span:last-child').evaluate(rect);
+  expect(label.left - icon.right).toBe(8);
+});
+
+test('Continue Watching series sit apart, their stacked cards short of the next tile', async ({ page }) => {
+  await seedSeries(page);
+  await page.addInitScript(() => {
+    const resume: Record<string, unknown> = {};
+    for (let i = 0; i < 3; i++) {
+      resume[`x1|episode|e${i}`] = {
+        accountId: 'x1', kind: 'episode', itemId: `e${i}`, name: `Series ${i} — S1E1`, poster: '', ext: 'mp4',
+        position: 100, duration: 600, updatedAt: 20 - i, season: 1, episode: 1,
+        watchlistOwner: { kind: 'series', itemId: `s${i}`, name: `Series ${i}`, poster: '' },
+      };
+    }
+    localStorage.setItem('iptv_resume', JSON.stringify(resume));
+  });
+  await page.goto('/');
+  await enterTab(page, 'series');
+  const tiles = page.locator('#view-series [data-rail-key="continue"] .catalog-tile-stack');
+  await expect(tiles).toHaveCount(3);
+
+  const layout = await tiles.evaluateAll((els) => els.map((el) => {
+    const r = el.getBoundingClientRect();
+    const back = getComputedStyle(el, '::after');
+    return { left: r.left, right: r.right, cardRight: r.left + parseFloat(back.width), card: back.content };
+  }));
+  for (let i = 1; i < layout.length; i++) {
+    expect(Math.round(layout[i].left - layout[i - 1].right)).toBe(32);
+    expect(layout[i - 1].card).not.toBe('none');
+    expect(layout[i - 1].cardRight).toBeLessThan(layout[i].left);
+  }
+});
+
+test('browse Series, open a detail, and play an episode', async ({ page }) => {
+  await seedSeries(page);
+  await routeLiveManifest(page);
+  // Keep VOD alive so the empty mock episode file doesn't fire `error` and
+  // auto-eject the player, which would race this test's own Back navigation.
+  await neuterVideo(page);
+  await page.goto('/');
+  await liveLoaded(page);
+
+  // Enter Series via the docked tab bar.
+  await enterTab(page, 'series');
+  await expect(page.locator('#view-series')).toBeVisible();
+
+  await expect(page.locator('#view-series .catalog-rail-title')).toContainText('Cat A');
+  await expect(page.locator('.catalog-tile[data-item-id="1"]')).toContainText('Series One');
+
+  // Open the series detail. Dispatch an explicit bubbling nav:hover so
+  // SpatialNav's container-bound listener focuses the tile before OK.
+  await page.locator('.catalog-tile[data-item-id="1"]')
+    .evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  await page.keyboard.press('Enter');
+  await expect(page.locator('#view-series .series-season-btn[data-season="1"]')).toContainText('Season 1');
+  await expect(page.locator('#view-series .episode-row[data-episode-id="10"]')).toContainText('Episode One');
+
+  // Play the episode, then Back returns to the Series view.
+  await page.locator('.episode-row[data-episode-id="10"]')
+    .evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  await page.keyboard.press('Enter');
+  await expect(page.locator('#view-player')).toBeVisible();
+  // Back key (CONFIG.KEYS.BACK = 461; Backspace is unmapped); dispatch a raw
+  // keydown like the other specs do.
+  await page.evaluate(() => document.dispatchEvent(new KeyboardEvent('keydown', { keyCode: 461, bubbles: true })));
+  await expect(page.locator('#view-series')).toBeVisible();
+  // The detail survives the player round-trip (Series isn't re-rendered on return).
+  await expect(page.locator('#view-series .episode-row[data-episode-id="10"]')).toContainText('Episode One');
+});
+
+test('Back walks Series detail -> browse -> Live instead of ejecting', async ({ page }) => {
+  await seedSeries(page);
+  await routeLiveManifest(page);
+  await page.goto('/');
+  await liveLoaded(page);
+
+  // Enter Series via the docked tab bar.
+  await enterTab(page, 'series');
+  await expect(page.locator('#view-series')).toBeVisible();
+
+  await expect(page.locator('.catalog-tile[data-item-id="1"]')).toContainText('Series One');
+
+  // Open the series detail.
+  await page.locator('.catalog-tile[data-item-id="1"]')
+    .evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  await page.keyboard.press('Enter');
+  await expect(page.locator('#view-series .series-season-btn[data-season="1"]')).toContainText('Season 1');
+
+  // First Back steps detail -> browse: still inside Series, not ejected to Live.
+  await page.evaluate(() => document.dispatchEvent(new KeyboardEvent('keydown', { keyCode: 461, bubbles: true })));
+  await expect(page.locator('#view-series')).toBeVisible();
+  await expect(page.locator('#view-series .catalog-rail-title')).toContainText('Cat A');
+  await expect(page.locator('#view-channels')).toBeHidden();
+
+  // Second Back from the browse top level returns to Live.
+  await page.evaluate(() => document.dispatchEvent(new KeyboardEvent('keydown', { keyCode: 461, bubbles: true })));
+  await liveLoaded(page);
+});
+
+test('episode playback suppresses the live channel sidebar and shows a VOD-only menu at the pointer edges', async ({ page }) => {
+  await seedSeries(page);
+  await routeLiveManifest(page);
+  // Keep VOD alive in the player: neuter the <video> so the empty mock episode
+  // file doesn't fire `error` and eject back to Series before we probe the edges.
+  await page.addInitScript(() => {
+    const P = HTMLMediaElement.prototype;
+    P.load = function () { /* no-op */ };
+    P.play = function () { return Promise.resolve(); };
+    Object.defineProperty(P, 'src', { configurable: true, set() { /* no-op */ }, get() { return ''; } });
+  });
+  await page.goto('/');
+  await liveLoaded(page);
+
+  // Enter Series, open a detail, and play an episode (VOD mode).
+  await enterTab(page, 'series');
+  await page.locator('.catalog-tile[data-item-id="1"]')
+    .evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  await page.keyboard.press('Enter');
+  await page.locator('.episode-row[data-episode-id="10"]')
+    .evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  await page.keyboard.press('Enter');
+  await expect(page.locator('#view-player')).toBeVisible();
+  // Wait until VOD playback has fully settled (the VOD OSD shows the title and,
+  // being paused, stays up) so the pointer probe isn't racing the transition.
+  await expect(page.locator('#player-osd .osd-channel-name')).toBeVisible();
+
+  // The left edge opens the channel switcher during live playback; an episode
+  // has no channels, so the pointer must not summon it. Check once (not a
+  // retrying wait) — the sidebar auto-hides, which would mask a wrong show.
+  await page.mouse.move(10, 540);
+  await page.waitForTimeout(200);
+  expect(await page.locator('#player-sidebar.visible').count()).toBe(0);
+
+  // The right edge opens the VOD menu for an episode too, including playback
+  // speed but never the live channel rows or the "Playing:" channel name.
+  await page.mouse.move(1900, 540);
+  const menu = page.locator('#player-menu');
+  await expect(menu).toBeVisible();
+  await expect(menu).toContainText('Title Info');
+  await expect(menu).toContainText('Settings');
+  await expect(menu).toContainText('Playback Speed');
+  expect(await menu.textContent()).not.toContain('Program Guide');
+  expect(await menu.textContent()).not.toContain('Toggle Favorite');
+  expect(await menu.textContent()).not.toContain('Playing:');
+});
+
+test('Down from the tab bar resumes the Series detail Up left', async ({ page }) => {
+  await seedSeries(page);
+  await routeLiveManifest(page);
+  await page.goto('/');
+  await liveLoaded(page);
+  await enterTab(page, 'series');
+  await page.locator('.catalog-tile[data-item-id="1"]')
+    .evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  await page.keyboard.press('Enter');
+  const season = page.locator('#view-series .series-season-btn[data-season="1"]');
+  await expect(season).toContainText('Season 1');
+
+  for (let i = 0; i < 8 && !(await page.locator('.tab-bar-item.focused').count()); i++) {
+    await page.keyboard.press('ArrowUp');
+  }
+  await expect(page.locator('.tab-bar-item[data-section="series"].focused')).toHaveCount(1);
+  await page.keyboard.press('ArrowDown');
+  await expect(season).toBeVisible();
+  await expect(page.locator('#view-series .focused')).toHaveCount(1);
+});
+
+const settled = (page: import('@playwright/test').Page) => page.evaluate(() =>
+  new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+
+// How far the element sticks out of the catalog's vertical scroller, in px.
+const overhang = (el: Element): number => {
+  let scroller = el.parentElement;
+  while (scroller && !/(auto|scroll)/.test(getComputedStyle(scroller).overflowY)) {
+    scroller = scroller.parentElement;
+  }
+  const box = el.getBoundingClientRect();
+  const clip = scroller?.getBoundingClientRect() ?? { top: 0, bottom: innerHeight };
+  return Math.max(0, clip.top - box.top, box.bottom - Math.min(clip.bottom, innerHeight));
+};
+
+test('a key that only shows the ring brings a clipped tile into view', async ({ page }) => {
+  await seedXtream(page, { catalog: 'large' });
+  await routeLiveManifest(page);
+  await page.addInitScript(() => {
+    localStorage.setItem('iptv_text_size', JSON.stringify('150'));
+  });
+  await page.goto('/');
+  await liveLoaded(page);
+  await enterTab(page, 'series');
+  const tile = page.locator('#view-series .catalog-tile').first();
+  await expect(tile).toBeVisible();
+  await settled(page);
+
+  // Larger text leaves the tile hanging off the bottom at the resting offset.
+  const clip = await tile.evaluate((el) => {
+    const rails = el.closest<HTMLElement>('.catalog-rails')!;
+    rails.style.scrollBehavior = 'auto';
+    rails.scrollTop = 0;
+    rails.style.scrollBehavior = '';
+    return el.getBoundingClientRect().bottom - innerHeight;
+  });
+  expect(clip).toBeGreaterThan(8);
+  await settled(page);
+  const box = (await tile.boundingBox())!;
+  await page.mouse.move(box.x + box.width / 2, box.y + 20);
+  await expect(tile).toHaveClass(/\bfocused\b/);
+  const key = await tile.getAttribute('data-key');
+  await settled(page);
+
+  await page.keyboard.press('ArrowRight');
+  const focused = page.locator('#view-series .focused');
+  await expect(focused).toHaveCount(1);
+  await expect.poll(() => focused.evaluate(overhang)).toBeLessThanOrEqual(1);
+  expect(await focused.getAttribute('data-key')).toBe(key);
+});
+
+test('opening the section with the pointer leaves the catalog where it loads', async ({ page }) => {
+  await seedXtream(page, { catalog: 'large' });
+  await routeLiveManifest(page);
+  await page.goto('/');
+  await liveLoaded(page);
+  await enterTab(page, 'series');
+  const first = page.locator('#view-series .catalog-tile').first();
+  await expect(first).toBeVisible();
+  await settled(page);
+  await settled(page);
+
+  expect(await page.locator('#view-series .catalog-rails').evaluate((el) => el.scrollTop)).toBe(0);
+  // Focus waits on the first tile, without a ring, for the first key.
+  await expect(page.locator('#view-series .focused')).toHaveCount(0);
+  const parked = page.locator('#view-series .focused-parked');
+  await expect(parked).toHaveCount(1);
+  expect(await parked.getAttribute('data-key')).toBe(await first.getAttribute('data-key'));
+});
+
+test('Right from an episode reaches its watched mark, and OK toggles it', async ({ page }) => {
+  await seedSeries(page);
+  await page.goto('/');
+  await liveLoaded(page);
+  await enterTab(page, 'series');
+  await page.locator('.catalog-tile[data-item-id="1"]')
+    .evaluate((el) => el.dispatchEvent(new CustomEvent('nav:hover', { bubbles: true })));
+  await page.keyboard.press('Enter');
+  const row = page.locator('#view-series .episode-row[data-episode-id="10"]');
+  const mark = page.locator('#view-series .episode-mark[data-episode-mark="10"]');
+  await expect(row).toBeVisible();
+  for (let i = 0; i < 6 && !(await row.evaluate((el) => el.classList.contains('focused'))); i++) {
+    await page.keyboard.press('ArrowDown');
+  }
+  await expect(row).toHaveClass(/focused/);
+  await page.keyboard.press('ArrowRight');
+  await expect(mark).toHaveClass(/focused/);
+  await page.keyboard.press('Enter');
+  await expect(mark).toHaveClass(/watched/);
+  await expect(row.locator('.episode-watched')).toBeVisible();
+  await expect(page.locator('#view-series [data-key="season-watched"]')).toContainText('Mark season as not watched');
+  await page.keyboard.press('ArrowLeft');
+  await expect(row).toHaveClass(/focused/);
+});

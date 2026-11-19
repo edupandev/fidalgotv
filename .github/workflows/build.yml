@@ -1,0 +1,124 @@
+name: Build IPK
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run typecheck:all
+
+      - name: Lint and compatibility gate
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm test
+
+  e2e:
+    runs-on: ubuntu-latest
+    # Chromium's system libraries come preinstalled, so no job waits on apt
+    # mirrors. Keep the tag in step with @playwright/test in the lockfile.
+    container:
+      image: mcr.microsoft.com/playwright:v1.64.1-resolute
+      options: --ipc=host
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # A no-op while the image matches the lockfile; otherwise it fetches the
+      # browser, still without apt.
+      - name: Install Playwright browser
+        run: npx playwright install chromium
+
+      - name: E2E tests
+        run: npm run test:e2e -- --shard=${{ matrix.shard }}/4
+
+      - name: Upload Playwright artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-artifacts-${{ matrix.shard }}
+          path: test-output/
+          retention-days: 7
+
+  package:
+    needs: [check, e2e]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install webOS CLI
+        run: npm install -g @webos-tools/cli@3.2.5
+
+      - name: Cache service runtimes
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/webos-iptv-player/node-runtimes
+          key: service-node-runtimes-v1-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Bundle
+        run: node esbuild.config.mjs
+
+      - name: Build service
+        run: npm run service:smoke:matrix
+
+      - name: Package IPK
+        run: ares-package --no-minify -e "*preview-libs.js" dist build/bundled-service -o .
+
+      - name: Generate Homebrew Channel manifest
+        run: npm run manifest
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: fidalgo-webos-lg
+          path: |
+            *.ipk
+            *.manifest.json
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            *.ipk
+            *.manifest.json

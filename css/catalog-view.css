@@ -1,0 +1,455 @@
+/* Shared styles for the Xtream catalog sections (Movies, Series) and the
+   Search results: hero, horizontal rails, poster grid, and the detail screens. */
+.catalog-hint {
+  margin: 0;
+  font-size: 30px;
+  color: var(--text-secondary);
+}
+
+/* Browse, grid, and detail stack as layers. A hidden layer keeps its layout
+   (and so its scroll offsets) instead of dropping to display: none. */
+.catalog-layer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+}
+.catalog-layer-hidden { visibility: hidden; }
+
+.catalog-view {
+  width: 1920px;
+  height: 100%;
+  box-sizing: border-box;
+  padding: 40px 80px 60px;
+  overflow-y: auto;
+}
+
+.catalog-loading,
+.catalog-empty { display: flex; align-items: center; justify-content: center; height: 100%; }
+
+.catalog-browse { position: relative; padding: 0; overflow: hidden; }
+
+.catalog-hero {
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background-size: cover;
+  background-position: center 28%;
+  background-color: var(--bg-primary);
+}
+.catalog-hero-scrim {
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background:
+    linear-gradient(90deg, rgb(var(--catalog-hero-scrim-rgb) / 0.95) 2%, rgb(var(--catalog-hero-scrim-rgb) / 0.5) 40%, transparent 72%),
+    linear-gradient(0deg, var(--bg-primary) 6%, transparent 52%);
+}
+.catalog-hero-body {
+  position: absolute;
+  left: 80px; top: 120px;
+  max-width: 960px;
+  z-index: 1;
+}
+.catalog-hero-kicker {
+  font-size: 22px; letter-spacing: 4px; font-weight: 700;
+  color: var(--accent); text-transform: uppercase;
+}
+.catalog-hero-title {
+  margin: 12px 0 0; font-size: 64px; font-weight: 800;
+  color: var(--text-primary); line-height: 1.05;
+}
+
+.catalog-rails {
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  overflow-y: auto;
+  overflow-anchor: none;
+  z-index: 2;
+}
+.catalog-rails-spacer { height: 45%; }
+.catalog-rails-body {
+  min-height: 55%;
+  padding: 8px 12px 60px 80px;
+  background: linear-gradient(180deg, transparent 0, rgb(var(--catalog-hero-scrim-rgb) / 0.85) 90px, var(--bg-primary) 240px);
+}
+
+.catalog-rail { margin-bottom: 28px; }
+.catalog-rail-title { margin: 0 0 12px; font-size: 30px; font-weight: 600; color: var(--text-primary); }
+.catalog-rail-track { display: flex; gap: 20px; overflow-x: auto; padding: 12px 12px 20px; margin: 0 -12px; }
+/* Rails and the browse page scroll by focus and pointer edge scroll; a rail
+   bar would also shrink the fixed-height category rail and add a vertical
+   one, and the page bar would cut into the full-bleed hero. Chrome 121+
+   ignores the webkit rule once scrollbar-color or scrollbar-width applies;
+   Chromium 53 ignores scrollbar-width and keeps the webkit rule. */
+/* stylelint-disable-next-line plugin/no-unsupported-browser-features */
+.catalog-rails, .catalog-rail-track { scrollbar-width: none; }
+.catalog-rails::-webkit-scrollbar, .catalog-rail-track::-webkit-scrollbar { display: none; }
+.catalog-rails-body .catalog-rail-track { margin-left: -80px; padding-left: 80px; }
+.catalog-category-rail { height: 152px; display: block; overflow-y: hidden; overflow-anchor: none; }
+.catalog-category-rail-spacer { position: relative; height: 120px; }
+.catalog-category-rail-cell {
+  position: absolute;
+  top: 0;
+  width: 300px;
+  height: 120px;
+}
+
+.catalog-grid-title { margin: 0 0 24px; font-size: 44px; font-weight: 700; color: var(--text-primary); }
+.catalog-grid-count { margin-left: 20px; font-size: 26px; font-weight: 400; color: var(--text-secondary); }
+.catalog-sort {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 24px;
+}
+.catalog-sort-label { font-size: 24px; color: var(--text-secondary); }
+.catalog-sort .dropdown { min-width: 240px; }
+.catalog-sort .dropdown-sizer { font-weight: 700; }
+.catalog-sort .dropdown-menu { max-height: none; }
+.catalog-sort .dropdown-trigger,
+.catalog-sort-direction { font-family: inherit; line-height: 1.4; }
+.catalog-sort .catalog-sort-direction { gap: 10px; min-width: 0; padding: 12px 16px; }
+.catalog-sort .catalog-sort-direction:not(.active) {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+}
+.catalog-sort .catalog-sort-direction.active { background: var(--catalog-sort-selected-bg); }
+.catalog-sort-direction-icon {
+  display: inline-flex;
+  width: calc(26px * var(--font-scale));
+  height: calc(26px * var(--font-scale));
+  flex: none;
+}
+.catalog-sort-direction-icon svg { width: 100%; height: 100%; }
+.catalog-grid-track { position: relative; width: 100%; }
+.catalog-grid-cell { position: absolute; width: 220px; height: 371px; }
+.catalog-grid-captioned .catalog-grid-cell { height: 395px; }
+
+.catalog-tile { width: 220px; flex: 0 0 auto; cursor: pointer; }
+.catalog-tile-placeholder { cursor: default; }
+.catalog-poster-wrap {
+  position: relative;
+  width: 220px; height: 330px;
+  border-radius: 12px; overflow: hidden;
+  background: var(--catalog-surface);
+}
+.catalog-poster { width: 100%; height: 100%; object-fit: cover; display: block; }
+.catalog-poster-empty { display: flex; align-items: center; justify-content: center; font-size: 72px; color: var(--text-secondary); }
+.catalog-tile-name {
+  margin-top: 10px; font-size: 22px; color: var(--text-primary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* A Continue Watching series: two cards fan out to its right. The cards sit
+   on the tile, not the poster wrap, whose overflow would clip them. */
+.catalog-tile-stack { position: relative; z-index: 0; }
+.catalog-tile-stack::before,
+.catalog-tile-stack::after {
+  content: '';
+  position: absolute; left: 0; z-index: -1;
+  border-radius: 12px;
+  background: var(--catalog-stack);
+}
+.catalog-tile-stack::before { top: 12px; width: 228px; height: 306px; opacity: var(--catalog-stack-near-opacity); }
+.catalog-tile-stack::after { top: 24px; width: 236px; height: 282px; opacity: var(--catalog-stack-far-opacity); }
+/* Room for the fanned cards beside the next tile's focus ring. */
+#view-series [data-rail-key="continue"] .catalog-rail-track { gap: 32px; }
+.catalog-tile-sub { font-size: 18px; line-height: 24px; color: var(--text-muted); }
+.catalog-tile.focused,
+.catalog-cat.focused {
+  box-shadow: none;
+  border-color: transparent !important;
+}
+.catalog-tile.focused .catalog-poster-wrap {
+  outline: 3px solid var(--catalog-focus);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 6px rgb(var(--catalog-focus-rgb) / 0.25), 0 10px 24px rgba(0, 0, 0, 0.6);
+}
+
+.catalog-see-all-card {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  padding: 0 16px; box-sizing: border-box; text-align: center; color: var(--text-primary);
+}
+.catalog-see-all-icon { width: 56px; height: 56px; color: var(--text-secondary); }
+.catalog-see-all-label { margin-top: 16px; font-size: 26px; }
+.catalog-see-all-count { margin-top: 4px; font-size: 20px; color: var(--text-secondary); }
+
+.catalog-cat {
+  width: 300px; height: 120px; flex: 0 0 auto;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 12px; background: var(--catalog-surface); border: 3px solid transparent;
+  font-size: 26px; color: var(--text-primary); text-align: center; padding: 0 16px;
+  box-sizing: border-box;
+}
+.catalog-cat.focused {
+  outline: 3px solid var(--catalog-focus);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 6px rgb(var(--catalog-focus-rgb) / 0.25);
+}
+
+.movies-detail { display: flex; gap: 56px; }
+.detail-poster-wrap {
+  width: 360px; height: 540px; flex: 0 0 auto;
+  border-radius: 16px; overflow: hidden; background: var(--catalog-surface);
+}
+.detail-body { flex: 1 1 auto; max-width: 1280px; }
+.detail-title { margin: 0 0 12px; font-size: 56px; font-weight: 700; color: var(--text-primary); }
+.detail-meta { font-size: 26px; color: var(--text-secondary); margin-bottom: 24px; }
+.detail-plot { max-width: 1000px; font-size: 28px; line-height: 1.5; color: var(--text-primary); margin: 0 0 24px; }
+.detail-cast { max-width: 1000px; font-size: 24px; color: var(--text-secondary); margin-bottom: 8px; }
+.detail-label { color: var(--text-primary); font-weight: 600; margin-right: 8px; }
+.detail-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 32px; }
+.detail-btn {
+  display: inline-flex; align-items: center; gap: 10px;
+  padding: 14px 20px; border-radius: 10px; border: 3px solid transparent;
+  background: var(--catalog-control); color: var(--text-primary); font-size: 24px; font-weight: 600;
+  white-space: nowrap; cursor: pointer;
+}
+.detail-btn-primary { background: var(--accent, #3ea6ff); color: #fff; }
+.detail-btn-danger { color: var(--danger); }
+.detail-btn.focused { border-color: var(--text-primary); }
+.detail-btn-icon { display: inline-flex; width: 28px; height: 28px; flex: 0 0 auto; }
+.detail-btn-icon svg { width: 100%; height: 100%; }
+.detail-btn-code { font-weight: 400; }
+.detail-btn-primary { position: relative; overflow: hidden; }
+.detail-btn-progress {
+  position: absolute; left: 0; right: 0; bottom: 0; height: 5px;
+  background: rgba(255, 255, 255, 0.3);
+}
+.detail-btn-progress > span { display: block; height: 100%; background: #fff; }
+
+/* Round secondary actions. The focused one's name slides out beside it and
+   pushes the rest along. The row takes the line's leftover width but never
+   less than its circles plus its longest name, so a row short of room for
+   the names wraps whole onto its own line instead of cutting them, and an
+   opening name never wraps it. The spacing is each button's own padding,
+   not a gap, so a pointer crossing the row always rests on a button and
+   never drops the open name. */
+.detail-icon-row {
+  flex: 1 1 0%; display: flex; align-items: center;
+  min-width: calc(74px * var(--icon-count, 1) - 12px + var(--name-width, 0px) + 22px);
+}
+/* Playback and title actions sit apart, without indenting a wrapped row. */
+.detail-actions > .detail-btn:last-of-type { margin-right: 12px; }
+.detail-icon-btn {
+  display: flex; align-items: center; flex: 0 1 auto; min-width: 74px; height: 62px; padding: 0 12px 0 0;
+  border: 0; background: none; color: var(--text-primary); cursor: pointer;
+}
+.detail-icon-btn:last-child { min-width: 62px; padding-right: 0; }
+button.detail-icon-btn.focused { box-shadow: none; }
+.detail-icon-btn.danger { color: var(--danger); }
+.detail-icon-circle {
+  display: flex; align-items: center; justify-content: center; flex: 0 0 auto;
+  width: 62px; height: 62px; box-sizing: border-box; border-radius: 50%;
+  border: 3px solid transparent; background: var(--catalog-control);
+  transition: border-color var(--transition), box-shadow var(--transition);
+}
+.detail-icon-circle svg { width: 28px; height: 28px; }
+/* On reads like an episode's watched mark: a white glyph on an accent circle. */
+.detail-icon-btn.on .detail-icon-circle { background: var(--accent); color: #fff; }
+.detail-icon-btn.focused .detail-icon-circle {
+  border-color: var(--focus-ring);
+  box-shadow: 0 0 0 3px var(--accent-glow), 0 0 20px var(--accent-glow);
+}
+/* The ring's accent would vanish into an on circle's accent fill. */
+.detail-icon-btn.on.focused .detail-icon-circle { border-color: var(--text-primary); }
+.detail-icon-label {
+  flex: 0 1 auto; min-width: 0; width: 0; overflow: hidden; white-space: nowrap;
+  opacity: 0; font-size: 24px; font-weight: 600;
+  transition: width 200ms ease-out, padding 200ms ease-out, opacity 200ms ease-out;
+}
+.detail-icon-row.names-instant .detail-icon-label { transition: none; }
+.detail-icon-btn.focused .detail-icon-label,
+.detail-icon-btn.name-held .detail-icon-label {
+  width: calc(var(--name-width, 600px) + 22px); padding: 0 8px 0 14px; opacity: 1; text-overflow: ellipsis;
+}
+.watchlist-glyph.set { fill: currentColor; }
+.watchlist-glyph.unset {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linejoin: round;
+}
+
+/* Series detail: a compact header (poster + season selector) over an episode list.
+   The whole page scrolls in .catalog-view (like the movie detail), so the header
+   scrolls away with the episodes; the virtualizer treats it as leading size. */
+.series-detail { display: block; }
+.series-detail-head { display: flex; gap: 56px; margin-bottom: 32px; }
+.series-detail-poster { width: 260px; height: 390px; }
+
+.series-seasons { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 24px; }
+/* Loading, failure, and no-episode notes take the season row's slot. */
+.series-detail-head .catalog-hint { margin-top: 24px; font-size: 26px; }
+.series-episodes .catalog-hint { font-size: 26px; }
+.series-season-btn {
+  padding: 12px 28px; border-radius: 10px; border: 3px solid transparent;
+  background: var(--catalog-control); color: var(--text-primary); font-size: 26px; font-weight: 600; cursor: pointer;
+}
+.series-season-btn.active { background: var(--accent, #3ea6ff); color: #fff; }
+.series-season-btn.focused { border-color: var(--text-primary); }
+
+.series-episodes { position: relative; overflow-anchor: none; }
+.series-episodes-spacer { position: relative; width: 100%; }
+.series-episode-cell { position: absolute; left: 0; right: 0; display: flex; align-items: stretch; gap: 16px; }
+.series-episode-cell .episode-row { flex: 1 1 auto; min-width: 0; }
+.episode-mark {
+  flex: 0 0 auto; width: 88px; padding: 0; border-radius: 12px; border: 3px solid transparent;
+  background: var(--catalog-surface); color: var(--text-secondary); cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+}
+.episode-mark svg { width: 36px; height: 36px; }
+/* Watched reads like a title's watched badge: a white check on an accent circle. */
+.episode-mark.watched svg {
+  box-sizing: border-box; width: 44px; height: 44px; padding: 9px;
+  border-radius: 50%; background: var(--accent); color: #fff;
+}
+.episode-mark.focused { border-color: var(--accent, #3ea6ff); }
+.episode-row {
+  box-sizing: border-box;
+  display: flex; gap: 20px; align-items: flex-start;
+  padding: 20px 24px; border-radius: 12px; background: var(--catalog-surface);
+  border: 3px solid transparent; cursor: pointer;
+}
+.episode-row.focused { border-color: var(--accent, #3ea6ff); }
+.episode-badge { display: inline-flex; width: 32px; height: 32px; flex: 0 0 auto; color: var(--text-secondary); margin-top: 4px; }
+.episode-badge svg { width: 100%; height: 100%; }
+.episode-body { flex: 1 1 auto; min-width: 0; }
+.episode-title { display: flex; align-items: center; gap: 16px; font-size: 28px; font-weight: 600; color: var(--text-primary); }
+.episode-num { color: var(--text-secondary); font-weight: 700; }
+.episode-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.episode-resume {
+  font-size: 20px; font-weight: 600; color: #fff;
+  background: var(--accent, #3ea6ff); border-radius: 6px; padding: 2px 12px;
+}
+.episode-meta { font-size: 22px; color: var(--text-secondary); margin-top: 6px; }
+.episode-plot {
+  font-size: 24px; line-height: 1.4; color: var(--text-secondary);
+  margin: 10px 0 0; max-height: 68px; overflow: hidden;
+}
+
+.catalog-rail-head { display: flex; align-items: center; gap: 24px; margin-bottom: 12px; }
+.catalog-rail-head .catalog-rail-title { margin: 0; }
+.catalog-collection-actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 24px;
+}
+.btn.catalog-collection-button {
+  min-height: 54px;
+  box-sizing: border-box;
+  gap: 12px;
+  font-weight: 500;
+}
+.catalog-action-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+}
+.catalog-action-icon svg { width: 100%; height: 100%; }
+.btn.catalog-collection-manage,
+.btn.catalog-collection-clear {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-secondary);
+}
+.btn.catalog-collection-manage.focused,
+.btn.catalog-collection-clear.focused {
+  background: var(--bg-tertiary);
+  border-color: var(--focus-ring);
+  color: var(--text-primary);
+}
+.catalog-collection-manage .catalog-action-icon { color: var(--text-muted); }
+.catalog-collection-manage.focused .catalog-action-icon { color: var(--accent); }
+/* Align the label with the posters while retaining the button's hit padding. */
+.btn.catalog-collection-clear { margin-left: auto; margin-right: -26px; }
+.catalog-collection-clear .catalog-action-icon { color: var(--danger); }
+.catalog-grid.catalog-managing { height: calc(100% - 64px); }
+.edit-hints.catalog-manage-hints { left: 0; height: 64px; box-sizing: border-box; padding: 0 80px; }
+.catalog-progress {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 6px;
+  background: var(--bg-tertiary);
+}
+.catalog-progress-fill { height: 100%; background: var(--accent); }
+.catalog-remove-mark {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  padding: 6px;
+  box-sizing: border-box;
+  background: transparent;
+  border: 2px solid transparent;
+  border-radius: var(--radius);
+  color: var(--danger);
+}
+.catalog-managing .catalog-tile { cursor: default; }
+.catalog-remove-mark.focused { border-color: transparent !important; box-shadow: none; }
+.catalog-remove-mark.focused circle { fill: var(--danger); }
+.catalog-remove-mark.focused path { stroke: #fff; }
+.catalog-poster-wrap .lock-badge ~ .catalog-remove-mark { right: 58px; }
+.catalog-remove-mark svg { width: 100%; height: 100%; }
+
+/* Watched and hidden marks. A watched title carries a solid check badge
+   opposite the lock badge; a watched episode a muted pill. */
+.catalog-watched-badge {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  width: 40px;
+  height: 40px;
+  padding: 8px;
+  box-sizing: border-box;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+}
+.catalog-watched-badge svg { display: block; width: 100%; height: 100%; }
+.episode-watched {
+  font-size: 20px; font-weight: 600; color: var(--text-secondary);
+  background: var(--catalog-control); border-radius: 6px; padding: 2px 12px;
+}
+
+/* Category grid filters share the sort row. Each label wraps with its control,
+   and a long genre stays one line: the genre menu scrolls on its own, so
+   revealing an option never scrolls the grid under it. */
+.catalog-filter-group { display: flex; align-items: center; gap: 16px; }
+.catalog-sort .catalog-filter-genre .dropdown { max-width: 360px; }
+.catalog-sort .catalog-filter-genre .dropdown-current {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.catalog-sort .catalog-filter-genre .dropdown-menu { max-height: 560px; }
+.catalog-filter-search { position: relative; display: block; width: calc(400px * var(--font-scale)); }
+.catalog-filter-icon {
+  position: absolute;
+  top: 50%;
+  left: 16px;
+  width: calc(24px * var(--font-scale));
+  height: calc(24px * var(--font-scale));
+  margin-top: calc(-12px * var(--font-scale));
+  color: var(--text-muted);
+  pointer-events: none;
+}
+.catalog-filter-icon svg { display: block; width: 100%; height: 100%; }
+/* The same 22px type and padding as the dropdown triggers, so the row's heights match. */
+.catalog-filter-input.settings-input {
+  box-sizing: border-box;
+  padding-left: calc(28px + 24px * var(--font-scale));
+  font-size: 22px;
+  line-height: 1.4;
+}

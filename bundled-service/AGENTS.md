@@ -1,0 +1,79 @@
+# bundled-service — AGENTS.md
+
+Scoped to `bundled-service/`; the root `AGENTS.md` still applies.
+
+A sandbox-separate Node (CommonJS) webOS service,
+`com.lennylxx.iptv.service`. It hosts LAN phone setup and M3U uploads and,
+in Developer Mode, interactive program-reminder alerts. It also reads
+manifests with channel headers for the app's Luna playback, and
+proxies header streams on loopback for the app's Local proxy mode, and
+sets the TV's per-app aspect ratio. `src/index.ts` wires `lan/`,
+`setup/`, `reminder/`, `fetch/`, `proxy/`, and `aspect/`.
+
+**Read `docs/lan-service.md` before changing it.**
+
+## Runtime: Node.js 0.12.2
+
+It must run on webOS 4's Node.js 0.12.2:
+
+- compile to ES5/CommonJS;
+- route newer Node APIs through `compat.ts`;
+- the final JavaScript build is gated, like the app bundle.
+
+Log through `createLogger(tag)` (`src/logger.ts`), never bare `console`:
+only its lines, plus every warning and error, reach the service log file
+that `tv.sh logs --service` and `tv.sh diag` read.
+
+## Contract with the app
+
+- **Luna:** `start` / `stop` / `heartbeat` / `serviceEvents` for LAN
+  changes; `getDevMode` / `fireReminderAlert` for reminders;
+  `fetchManifest` (app-only) for Luna header playback; `openProxy` /
+  `touchProxy` / `closeProxy` (app-only) for Local proxy header playback;
+  `setAspectRatio` (app-only) for the TV's per-app aspect ratio, which
+  settingsservice denies the app but answers on an anonymous palmbus
+  handle (`docs/lan-service.md`). Register an app-only method with
+  `appMethod` in `src/luna-reply.ts`, which owns the caller check, the
+  `outcome=denied` log, the one-shot responder, and `lunaFailure`.
+- **HTTP:** phone setup pages and uploads; a separate loopback-only
+  proxy server for Local proxy sessions, plus its `POST /open`,
+  `/touch`, and `/close` control routes when run standalone off the TV
+  (`docs/lan-service.md`).
+- Changes are pushed through `serviceEvents`; nothing polls.
+- The lifecycle follows the app's `visibilitychange`.
+
+Keep both sides aligned with `src/services/setup-client.ts`,
+`src/services/upload-client.ts`, `src/services/manifest-service.ts`, and
+`src/services/proxy-service.ts` in
+the app, and update their colocated tests
+with any messaging change.
+
+## Reminder alerts
+
+`com.webos.notification/createAlert` (with buttons) is denied to every
+identity the app or service can present; the block is identity-based in the
+notification daemon, not an `appinfo.json`/ACG gap. Passive `createToast`
+works. Only `/usr/bin/luna-send-pub` (Luna role `type:"devmode"`) may raise
+`createAlert`, and only while Developer Mode is on, so the service execs it
+through `child_process` for the dev-mode alert; retail falls back to a toast
+plus an in-app prompt.
+
+Reminders are scheduled through the Activity Manager
+(`com.webos.service.activitymanager` `create` with a `callback` and
+`schedule.start`, `local: true`), which fires at air time **even with the
+app closed**. The dev callback targets the service's `fireReminderAlert`;
+the retail callback targets `createToast`.
+
+## Verify
+
+```bash
+npm run service:smoke          # build + gate + real Node.js 0.12.2 smoke
+npm run service:smoke:matrix   # webOS 4-26 representative runtimes
+```
+
+`service:smoke` downloads the official Node.js 0.12.2 archive, verifies its
+published SHA-256, caches it under the user cache directory, then parses and
+exercises the compiled service with that exact runtime. CI runs the matrix
+across Node.js 0.12.2, 8.12.0, 12.21.0, 16.19.1, and 20.12.2 (webOS 4
+through 26). On Apple Silicon, Node 16/20 run as arm64 and older releases as
+x64 through Rosetta.

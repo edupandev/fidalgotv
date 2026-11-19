@@ -1,0 +1,594 @@
+// @vitest-environment jsdom
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { notifyPointerGone } from '../navigation/input-mode';
+import { CONFIG } from '../config';
+import { StorageService } from '../services/storage-service';
+import type { Channel, Programme, VodQueueItem } from '../types';
+import type { DvrState } from '../utils/dvr';
+import { PlayerOsd, upNextCard, vodHeading, type PlayerOsdOptions, type PlayerOsdSnapshot } from './player-osd';
+
+const CHANNEL: Channel = {
+  id: 'ch1',
+  name: 'Alpha',
+  logo: 'http://host/logo',
+  group: 'Group 1',
+  url: 'http://host/a',
+  extras: null,
+  playlistIds: [],
+  catchup: '',
+  catchupSource: '',
+  catchupDays: 0,
+};
+
+const PROGRAMME: Programme = {
+  start: new Date('2026-01-01T10:00:00Z'),
+  stop: new Date('2026-01-01T11:00:00Z'),
+  title: 'Programme 1',
+  description: 'Description 1',
+  category: 'Category 1',
+  icon: 'http://host/icon',
+};
+
+function playback(duration: number, position = 0, paused = false) {
+  return { duration, position, paused };
+}
+
+function snapshot(overrides: Partial<PlayerOsdSnapshot> = {}): PlayerOsdSnapshot {
+  return {
+    playback: null,
+    channel: CHANNEL,
+    channelNumber: 1,
+    catchup: null,
+    vodTitle: null,
+    vodDetail: '',
+    upNextSeconds: 0,
+    upNext: null,
+    episodeNav: null,
+    dvr: null,
+    nowPlaying: null,
+    upcoming: null,
+    streamInfo: null,
+    scrub: null,
+    ...overrides,
+  };
+}
+
+function rect(left: number, top: number, width: number, height: number): DOMRect {
+  return {
+    left,
+    right: left + width,
+    top,
+    bottom: top + height,
+    width,
+    height,
+  } as DOMRect;
+}
+
+describe('PlayerOsd', () => {
+  let container: HTMLElement;
+  let state: PlayerOsdSnapshot;
+  let callbacks: PlayerOsdOptions;
+  let osd: PlayerOsd;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    localStorage.clear();
+    container = document.createElement('div');
+    container.innerHTML = '<div id="player-osd"></div>';
+    document.body.appendChild(container);
+    state = snapshot();
+    callbacks = {
+      getSnapshot: () => state,
+      canAutoReveal: () => true,
+      canSeek: () => true,
+      onSeekFraction: vi.fn(),
+      onHoverFraction: vi.fn(),
+      onPauseToggle: vi.fn(),
+      onGoLive: vi.fn(),
+      onResync: vi.fn(),
+      onPlayNext: vi.fn(),
+      onCancelNext: vi.fn(),
+      onSkipEpisode: vi.fn(),
+    };
+    osd = new PlayerOsd(container, callbacks);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    document.body.innerHTML = '';
+  });
+
+  it('shows, hides, auto-reveals, and stays visible while paused', () => {
+    state = snapshot({ playback: playback(120), vodTitle: 'Video 1' });
+
+    osd.show();
+    expect(osd.isVisible()).toBe(true);
+    expect(container.querySelector('#player-osd')?.classList.contains('hidden')).toBe(false);
+    vi.advanceTimersByTime(CONFIG.PLAYER.DEFAULT_PLAYER_OSD_TIMEOUT_MS);
+    expect(osd.isVisible()).toBe(false);
+
+    container.dispatchEvent(new MouseEvent('mousemove', {
+      bubbles: true,
+      clientX: 12,
+      clientY: 34,
+    }));
+    expect(osd.isVisible()).toBe(true);
+    expect(osd.pointerPosition()).toEqual({ x: 12, y: 34 });
+
+    state = { ...state, playback: playback(120, 0, true) };
+    osd.resetTimer();
+    vi.advanceTimersByTime(CONFIG.PLAYER.DEFAULT_PLAYER_OSD_TIMEOUT_MS);
+    expect(osd.isVisible()).toBe(true);
+
+    osd.clearPointer();
+    osd.hide();
+    expect(osd.pointerPosition()).toEqual({ x: null, y: null });
+    expect(container.querySelector('#player-osd')?.classList.contains('hidden')).toBe(true);
+  });
+
+  it('uses the configured auto-hide timeout', () => {
+    StorageService.setPlayerOsdTimeoutMs(3000);
+    osd.show();
+    vi.advanceTimersByTime(2999);
+    expect(osd.isVisible()).toBe(true);
+    vi.advanceTimersByTime(1);
+    expect(osd.isVisible()).toBe(false);
+  });
+
+  it('renders representative Live, catch-up, VOD, and up-next layouts', () => {
+    state = snapshot({
+      playback: playback(120, 30),
+      nowPlaying: PROGRAMME,
+      upcoming: { ...PROGRAMME, title: 'Programme 2' },
+      streamInfo: {
+        resolution: { tier: 'hd', label: 'Info 1' },
+        hdr: 'HDR',
+        drm: 'PlayReady',
+        fps: '30',
+        videoCodec: 'Codec 1',
+        audioCodec: 'Codec 2',
+        audio: 'Track 1',
+        subtitle: 'Track 2',
+      },
+    });
+    osd.show();
+    expect(container.textContent).toContain('Alpha');
+    expect(container.textContent).toContain('Programme 1');
+    expect(container.textContent).toContain('Programme 2');
+    expect(container.textContent).toContain('Info 1');
+    expect(container.textContent).toContain('HDR');
+    expect(container.textContent).toContain('PlayReady');
+    expect(container.textContent).toContain('30fps');
+    expect(container.textContent).toContain('Codec 1');
+    expect(container.textContent).toContain('Audio Track: Track 1');
+
+    state = snapshot({
+      playback: playback(120, 30),
+      catchup: {
+        start: 1_000_000,
+        end: 1_000_120,
+        title: 'Programme 3',
+        description: 'Description 3',
+        icon: '',
+      },
+    });
+    osd.render();
+    expect(container.textContent).toContain('Programme 3');
+    expect(container.querySelector('[data-seekbar]')).not.toBeNull();
+    expect(container.querySelector('[data-resync]')).not.toBeNull();
+
+    state = snapshot({ playback: playback(120, 30), channel: null, vodTitle: 'Video 1' });
+    osd.render();
+    expect(container.querySelector('.osd-channel-name')?.textContent).toContain('Video 1');
+    expect(container.querySelector<HTMLElement>('.osd-progress-bar')?.style.width).toBe('25%');
+
+    state = { ...state, upNextSeconds: 5, upNext: { title: 'Video 2', detail: '', image: '', poster: true } };
+    osd.render();
+    expect(container.textContent).toContain('Video 2');
+    expect(container.querySelector('[data-next-play]')).not.toBeNull();
+    expect(container.querySelector('[data-next-cancel]')).not.toBeNull();
+  });
+
+  it('does not repeat an audio-track prefix already present in the name', () => {
+    state = snapshot({
+      streamInfo: {
+        resolution: null,
+        hdr: '',
+        drm: '',
+        fps: '',
+        videoCodec: '',
+        audioCodec: '',
+        audio: 'Audio Track 1',
+        subtitle: '',
+      },
+    });
+
+    osd.show();
+
+    expect(container.textContent).toContain('Audio Track 1');
+    expect(container.textContent).not.toContain('Audio Track: Audio Track 1');
+  });
+
+  it('refreshes progress and switches an open Live OSD to the DVR layout', () => {
+    state = snapshot({ playback: playback(Infinity, 30), nowPlaying: PROGRAMME });
+    osd.show();
+    expect(container.querySelector('[data-golive]')).toBeNull();
+
+    const dvr: DvrState = {
+      start: 0,
+      end: 60,
+      length: 60,
+      position: 30,
+      fraction: 0.5,
+      behindLive: 30,
+      atLiveEdge: false,
+    };
+    state = { ...state, dvr };
+    osd.refreshProgress();
+    expect(container.querySelector('[data-golive]')).not.toBeNull();
+    expect(container.querySelector<HTMLElement>('.osd-progress-bar')?.style.width).toBe('50%');
+
+    state = { ...state, dvr: { ...dvr, fraction: 0.75, behindLive: 15 } };
+    osd.refreshProgress();
+    expect(container.querySelector<HTMLElement>('.osd-progress-bar')?.style.width).toBe('75%');
+    expect(container.querySelector('.osd-dvr-behind')?.textContent).toBe('-0:15');
+  });
+
+  it('marks a pending seek target with its time, jump, and preview tile', () => {
+    state = snapshot({ playback: playback(600, 60), vodTitle: 'Video 1' });
+    osd.show();
+    expect(container.querySelector('[data-scrub]')).toBeNull();
+
+    state = snapshot({
+      playback: playback(600, 60),
+      vodTitle: 'Video 1',
+      scrub: {
+        fraction: 0.25,
+        target: 150,
+        delta: 90,
+        behindLive: null,
+        thumbnail: {
+          url: 'http://host/sheet.jpg',
+          tile: { x: 160, y: 90, w: 160, h: 90 },
+          width: 800,
+          height: 180,
+        },
+      },
+    });
+    osd.refreshProgress();
+    const marker = container.querySelector<HTMLElement>('[data-scrub]')!;
+    expect(marker.style.left).toBe('25%');
+    expect(marker.querySelector('.osd-scrub-time')?.textContent).toBe('2:30');
+    expect(marker.querySelector('.osd-scrub-delta')?.textContent).toBe('+1:30');
+    const image = marker.querySelector<HTMLImageElement>('.osd-scrub-image')!;
+    // A 160px tile scaled to the 320px frame: the 800x180 sheet doubles and
+    // shifts so tile (160, 90) sits in the window.
+    expect(image.getAttribute('src')).toBe('http://host/sheet.jpg');
+    expect(image.style.width).toBe('1600px');
+    expect(image.style.left).toBe('-320px');
+    expect(image.style.top).toBe('-180px');
+
+    state = snapshot({
+      playback: playback(600, 60),
+      dvr: { fraction: 0.5, behindLive: 0, atLiveEdge: true } as DvrState,
+      scrub: { fraction: 0.4, target: 40, delta: -20, behindLive: 45, thumbnail: null },
+    });
+    osd.render();
+    expect(container.querySelector('.osd-scrub-time')?.textContent).toBe('-0:45');
+    expect(container.querySelector('.osd-scrub-delta')?.textContent).toBe('-0:20');
+    expect(container.querySelector('.osd-scrub-image')).toBeNull();
+
+    state = snapshot({ playback: playback(600, 60), dvr: state.dvr });
+    osd.refreshProgress();
+    expect(container.querySelector('[data-scrub]')).toBeNull();
+  });
+
+  it('centers the bubble on the knob, pushed inward only at the ends', () => {
+    const host = 1000;
+    const bubble = 200;
+    const restore = [
+      // A hidden OSD lays out nothing, as in a browser.
+      ['offsetWidth', function (this: HTMLElement) {
+        return !this.closest('.hidden') && this.classList.contains('osd-scrub-bubble') ? bubble : 0;
+      }],
+      ['offsetLeft', function (this: HTMLElement) {
+        return !this.closest('.hidden') && this.hasAttribute('data-scrub')
+          ? parseFloat(this.style.left) / 100 * host : 0;
+      }],
+      ['clientWidth', function (this: HTMLElement) {
+        return !this.closest('.hidden') && this.hasAttribute('data-scrub-host') ? host : 0;
+      }],
+    ].map(([name, get]) => {
+      const original = Object.getOwnPropertyDescriptor(HTMLElement.prototype, name as string);
+      Object.defineProperty(HTMLElement.prototype, name as string, { configurable: true, get: get as () => number });
+      return () => {
+        if (original) Object.defineProperty(HTMLElement.prototype, name as string, original);
+        else delete (HTMLElement.prototype as unknown as Record<string, unknown>)[name as string];
+      };
+    });
+    try {
+      const shift = (fraction: number): string => {
+        state = snapshot({
+          playback: playback(600, 60),
+          vodTitle: 'Video 1',
+          scrub: { fraction, target: fraction * 600, delta: 0, behindLive: null, thumbnail: null },
+        });
+        osd.refreshProgress();
+        return container.querySelector<HTMLElement>('.osd-scrub-bubble')!.style.transform;
+      };
+      state = snapshot({ playback: playback(600, 60), vodTitle: 'Video 1' });
+      osd.show();
+      expect(shift(0.3)).toBe('translateX(-100px)');
+      expect(shift(0.5)).toBe('translateX(-100px)');
+      expect(shift(0.02)).toBe('translateX(-20px)');
+      expect(shift(0.98)).toBe('translateX(-180px)');
+      osd.render();
+      expect(container.querySelector<HTMLElement>('.osd-scrub-bubble')!.style.transform)
+        .toBe('translateX(-180px)');
+
+      // Shown with a pending target: placed once the OSD can be measured.
+      osd.hide();
+      state = { ...state, scrub: { ...state.scrub!, fraction: 0.5, target: 300 } };
+      osd.show();
+      expect(container.querySelector<HTMLElement>('.osd-scrub-bubble')!.style.transform)
+        .toBe('translateX(-100px)');
+    } finally {
+      restore.forEach(undo => undo());
+    }
+  });
+
+  describe('seek-bar hover', () => {
+    let frames: Map<number, FrameRequestCallback>;
+    const flushFrame = () => {
+      const pending = Array.from(frames.values());
+      frames.clear();
+      for (const fn of pending) fn(0);
+    };
+    const move = (clientX: number, clientY: number) =>
+      container.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX, clientY }));
+
+    beforeEach(() => {
+      frames = new Map();
+      let id = 0;
+      vi.stubGlobal('requestAnimationFrame', (fn: FrameRequestCallback) => { frames.set(++id, fn); return id; });
+      vi.stubGlobal('cancelAnimationFrame', (handle: number) => { frames.delete(handle); });
+      state = snapshot({ playback: playback(120), vodTitle: 'Video 1' });
+      osd.show();
+      const seekbar = container.querySelector('[data-seekbar]') as HTMLElement;
+      seekbar.getBoundingClientRect = () => rect(100, 50, 400, 20);
+    });
+    afterEach(() => vi.unstubAllGlobals());
+
+    it('reports the hovered fraction once per frame and clears it on hide', () => {
+      const report = vi.mocked(callbacks.onHoverFraction);
+      move(150, 60);
+      move(200, 60);
+      expect(report).not.toHaveBeenCalled();
+      flushFrame();
+      expect(report.mock.calls).toEqual([[0.25]]);
+      move(200, 300);
+      flushFrame();
+      expect(report).toHaveBeenLastCalledWith(null);
+      move(300, 60);
+      osd.hide();
+      flushFrame();
+      expect(report).toHaveBeenLastCalledWith(null);
+    });
+
+    it('clears the hover when the pointer leaves the window', () => {
+      move(200, 60);
+      flushFrame();
+      notifyPointerGone();
+      expect(callbacks.onHoverFraction).toHaveBeenLastCalledWith(null);
+    });
+  });
+
+  it('routes pointer seeks and control clicks through callbacks', () => {
+    state = snapshot({
+      playback: playback(120, 30),
+      catchup: {
+        start: 1_000_000,
+        end: 1_000_120,
+        title: 'Programme 1',
+        description: '',
+        icon: '',
+      },
+    });
+    osd.show();
+
+    const seekbar = container.querySelector('[data-seekbar]') as HTMLElement;
+    seekbar.getBoundingClientRect = () => rect(100, 50, 400, 20);
+    container.dispatchEvent(new MouseEvent('click', {
+      bubbles: true,
+      clientX: 400,
+      clientY: 60,
+    }));
+    expect(callbacks.onSeekFraction).toHaveBeenCalledWith(0.75);
+
+    const pause = container.querySelector('[data-playpause]') as HTMLElement;
+    pause.getBoundingClientRect = () => rect(10, 10, 30, 30);
+    container.dispatchEvent(new MouseEvent('click', {
+      bubbles: true,
+      clientX: 20,
+      clientY: 20,
+    }));
+    expect(callbacks.onPauseToggle).toHaveBeenCalledOnce();
+
+    const resync = container.querySelector('[data-resync]') as HTMLElement;
+    resync.getBoundingClientRect = () => rect(600, 10, 30, 30);
+    container.dispatchEvent(new MouseEvent('click', {
+      bubbles: true,
+      clientX: 610,
+      clientY: 20,
+    }));
+    expect(callbacks.onResync).toHaveBeenCalledOnce();
+
+    state = snapshot({
+      playback: playback(120, 30),
+      channel: null,
+      vodTitle: 'Video 2',
+      upNextSeconds: 5,
+      upNext: { title: 'Video 2', detail: '', image: '', poster: true },
+    });
+    osd.render();
+    const playNext = container.querySelector('[data-next-play]') as HTMLElement;
+    playNext.getBoundingClientRect = () => rect(50, 100, 80, 30);
+    container.dispatchEvent(new MouseEvent('click', {
+      bubbles: true,
+      clientX: 60,
+      clientY: 110,
+    }));
+    expect(callbacks.onPlayNext).toHaveBeenCalledOnce();
+  });
+
+  it('reuses keyed programme icons and removes failed URLs until cleared', () => {
+    state = snapshot({
+      catchup: {
+        start: 1_000_000,
+        end: 1_000_120,
+        title: 'Programme 1',
+        description: '',
+        icon: 'http://host/icon',
+      },
+    });
+    osd.show();
+    const first = container.querySelector('.osd-programme-icon');
+    expect(first).not.toBeNull();
+
+    osd.render();
+    expect(container.querySelector('.osd-programme-icon')).toBe(first);
+
+    first?.dispatchEvent(new Event('error'));
+    expect(container.querySelector('.osd-programme-icon')).toBeNull();
+    osd.render();
+    expect(container.querySelector('.osd-programme-icon')).toBeNull();
+
+    osd.clearFailedIcons();
+    osd.render();
+    expect(container.querySelector('.osd-programme-icon')).not.toBeNull();
+  });
+
+  it('shows Up next with its still, and starts the text at the edge without one', () => {
+    const upNext = { title: 'Series One', detail: 'S1 E2 · Episode Two', image: 'http://host/still', poster: false };
+    state = snapshot({ playback: playback(120, 30), channel: null, vodTitle: 'Series One — S1E2', upNextSeconds: 5, upNext });
+    osd.show();
+    const thumb = container.querySelector('.osd-next-episode-thumb');
+    expect(thumb?.getAttribute('src')).toBe('http://host/still');
+    expect(container.querySelector('.osd-next-episode-title')?.textContent).toBe('Series One');
+    expect(container.querySelector('.osd-vod-detail')?.textContent).toBe('S1 E2 · Episode Two');
+    expect(container.querySelector('.osd-next-episode')?.firstElementChild).toBe(thumb);
+
+    thumb?.dispatchEvent(new Event('error'));
+    expect(container.querySelector('.osd-next-episode-thumb')).toBeNull();
+    expect(container.querySelector('.osd-next-episode')?.firstElementChild?.className)
+      .toBe('osd-next-episode-body');
+
+    state = { ...state, upNext: { title: 'Movie Two', detail: '', image: '', poster: true } };
+    osd.render();
+    expect(container.querySelector('.osd-next-episode-thumb')).toBeNull();
+    expect(container.querySelector('.osd-vod-detail')).toBeNull();
+  });
+});
+
+describe('PlayerOsd episode skips', () => {
+  it('flanks play/pause with skips for an episode, disabled at the series\' ends', () => {
+    const container = document.createElement('div');
+    container.innerHTML = '<div id="player-osd"></div>';
+    document.body.appendChild(container);
+    let state = snapshot({ playback: playback(120, 30), channel: null, vodTitle: 'Video 1',
+      episodeNav: { previous: false, next: true } });
+    const onSkipEpisode = vi.fn();
+    const osd = new PlayerOsd(container, {
+      getSnapshot: () => state, canAutoReveal: () => true, canSeek: () => true,
+      onSeekFraction: vi.fn(), onHoverFraction: vi.fn(), onPauseToggle: vi.fn(), onGoLive: vi.fn(), onResync: vi.fn(),
+      onPlayNext: vi.fn(), onCancelNext: vi.fn(), onSkipEpisode,
+    });
+    osd.show();
+    const row = Array.from(container.querySelectorAll('.osd-progress-row > button'))
+      .map((b) => b.getAttribute('data-skip-episode') ?? (b.hasAttribute('data-playpause') ? 'play' : 'other'));
+    expect(row.slice(0, 3)).toEqual(['-1', 'play', '1']);
+    const previous = container.querySelector<HTMLElement>('[data-skip-episode="-1"]')!;
+    const next = container.querySelector<HTMLElement>('[data-skip-episode="1"]')!;
+    expect(previous.hasAttribute('disabled')).toBe(true);
+    expect(next.getAttribute('aria-label')).toBe('Next episode');
+
+    previous.getBoundingClientRect = () => rect(10, 10, 30, 30);
+    next.getBoundingClientRect = () => rect(90, 10, 30, 30);
+    container.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: 20, clientY: 20 }));
+    expect(onSkipEpisode).not.toHaveBeenCalled();
+    container.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: 100, clientY: 20 }));
+    expect(onSkipEpisode).toHaveBeenCalledWith(1);
+
+    state = { ...state, episodeNav: null };
+    osd.render();
+    expect(container.querySelector('[data-skip-episode]')).toBeNull();
+    container.remove();
+  });
+});
+
+describe('PlayerOsd VOD heading', () => {
+  it('puts an episode\'s "S1 E2 · Title" under its series, and a movie on one line', () => {
+    const container = document.createElement('div');
+    container.innerHTML = '<div id="player-osd"></div>';
+    document.body.appendChild(container);
+    let state = snapshot({ playback: playback(120, 30), channel: null,
+      vodTitle: 'Series One', vodDetail: 'S1 E2 · Episode Two' });
+    const osd = new PlayerOsd(container, {
+      getSnapshot: () => state, canAutoReveal: () => true, canSeek: () => true,
+      onSeekFraction: vi.fn(), onHoverFraction: vi.fn(), onPauseToggle: vi.fn(), onGoLive: vi.fn(), onResync: vi.fn(),
+      onPlayNext: vi.fn(), onCancelNext: vi.fn(), onSkipEpisode: vi.fn(),
+    });
+    osd.show();
+    expect(container.querySelector('.osd-channel-name')?.textContent).toBe('Series One');
+    expect(container.querySelector('.osd-channel + .osd-vod-detail')?.textContent).toBe('S1 E2 · Episode Two');
+    state = { ...state, vodTitle: 'Movie One', vodDetail: '' };
+    osd.render();
+    expect(container.querySelector('.osd-vod-detail')).toBeNull();
+    container.remove();
+  });
+});
+
+describe('upNextCard', () => {
+  const item = (over: Partial<VodQueueItem> = {}): VodQueueItem => ({
+    url: 'http://host/e2.mp4', title: 'Series One — S1E2 — Episode Two', poster: 'http://host/still',
+    accountId: 'x1', itemId: 'e2', kind: 'episode', subtitles: [], ...over,
+  });
+
+  it('heads a playing episode the way its up-next card does', () => {
+    const episode = item({
+      searchMeta: { season: 1, episode: 2 }, episodeTitle: 'Episode Two',
+      watchlistOwner: { kind: 'series', itemId: 's1', name: 'Series One' },
+    });
+    expect(vodHeading(episode)).toEqual({ title: 'Series One', detail: 'S1 E2 · Episode Two' });
+    expect(vodHeading(item({ kind: 'vod', title: 'Movie Two' }))).toEqual({ title: 'Movie Two', detail: '' });
+  });
+
+  it('recovers the episode title from the label of an item saved without it', () => {
+    const owner = { kind: 'series' as const, itemId: 's1', name: 'Series One' };
+    expect(vodHeading(item({ searchMeta: { season: 1, episode: 2 }, watchlistOwner: owner })).detail)
+      .toBe('S1 E2 · Episode Two');
+    expect(vodHeading(item({ title: 'Series One — S1E2', searchMeta: { season: 1, episode: 2 }, watchlistOwner: owner })).detail)
+      .toBe('S1 E2');
+  });
+
+  it('splits an episode into its series and "S1 E2 · Title"', () => {
+    expect(upNextCard(item({
+      searchMeta: { season: 1, episode: 2 }, episodeTitle: 'Episode Two',
+      watchlistOwner: { kind: 'series', itemId: 's1', name: 'Series One' },
+    }))).toEqual({ title: 'Series One', detail: 'S1 E2 · Episode Two', image: 'http://host/still', poster: false });
+    expect(upNextCard(item({
+      title: 'Series One — S1E2',
+      searchMeta: { season: 1, episode: 2 },
+      watchlistOwner: { kind: 'series', itemId: 's1', name: 'Series One' },
+    })).detail).toBe('S1 E2');
+  });
+
+  it('keeps the whole label of an item saved without its series name, and a movie\'s poster', () => {
+    expect(upNextCard(item({ watchlistOwner: { kind: 'series', itemId: 's1' } })))
+      .toEqual({ title: 'Series One — S1E2 — Episode Two', detail: '', image: 'http://host/still', poster: false });
+    expect(upNextCard(item({ kind: 'vod', title: 'Movie Two' })).poster).toBe(true);
+    expect(upNextCard(item({
+      poster: 'http://host/series', watchlistOwner: { kind: 'series', itemId: 's1', poster: 'http://host/series' },
+    })).poster).toBe(true);
+  });
+});

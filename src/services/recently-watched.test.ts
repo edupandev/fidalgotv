@@ -1,0 +1,274 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { CatchupProgressEntry, Channel, RecentlyWatchedLiveEntry } from '../types';
+
+const { data, archiveMock, storageMock, epgMock, playlistMock } = vi.hoisted(() => {
+  const channels: Channel[] = [];
+  const live: RecentlyWatchedLiveEntry[] = [];
+  const catchup: CatchupProgressEntry[] = [];
+  const data = { channels, live, catchup, available: true };
+  return {
+    data,
+    archiveMock: {
+      load: vi.fn(async () => null),
+      isAvailable: vi.fn((..._args: unknown[]) => data.available),
+    },
+    storageMock: {
+      getRecentlyWatchedLive: vi.fn(() => data.live),
+      getAllCatchupProgress: vi.fn(() => data.catchup),
+      clearCatchupProgress: vi.fn(),
+    },
+    epgMock: {
+      programmes: {} as Record<string, Array<{
+        start: Date;
+        stop: Date;
+        title: string;
+        description: string;
+        category: string;
+        icon: string;
+      }>>,
+      findChannelId: vi.fn((): string | null => null),
+      catchupIdsKnown: vi.fn(() => true),
+      getProgrammeAtStart: vi.fn(function (this: {
+        programmes: Record<string, Array<{ start: Date }>>;
+      }, id: string, timestamp: number) {
+        return this.programmes[id]?.find(item => item.start.getTime() === timestamp) ?? null;
+      }),
+    },
+    playlistMock: {
+      channels: data.channels,
+      resolveChannelKey: vi.fn((key: string, _stream?: string, prefer?: (ch: Channel) => boolean) => {
+        const shared = data.channels.filter(ch => channelKey(ch) === key);
+        const exact = (prefer && shared.find(prefer)) || shared[0];
+        return exact ? { channel: exact, channelIndex: data.channels.indexOf(exact) } : null;
+      }),
+    },
+  };
+});
+
+vi.mock('./playlist-service', () => ({ PlaylistService: playlistMock }));
+vi.mock('./storage-service', () => ({ StorageService: storageMock }));
+vi.mock('./epg-service', () => ({ EpgService: epgMock }));
+vi.mock('./xtream-archive', () => ({ XtreamArchiveService: archiveMock }));
+
+import { RecentlyWatchedService } from './recently-watched';
+import { channelKey } from '../utils/channel';
+
+const channel = (over: Partial<Channel> = {}): Channel => ({
+  id: 'ch1',
+  name: 'Channel Alpha',
+  logo: '',
+  group: 'Group 1',
+  url: 'http://host/a',
+  extras: null,
+  playlistIds: ['p1'],
+  catchup: 'default',
+  catchupSource: 'http://host/catchup/{utc}',
+  catchupDays: 7,
+  ...over,
+});
+
+const progress = (ch: Channel, over: Partial<CatchupProgressEntry> = {}): CatchupProgressEntry => ({
+  channelKey: channelKey(ch),
+  progStart: 1_000_000,
+  progEnd: 4_600_000,
+  title: 'Program Alpha',
+  description: 'Summary',
+  icon: '',
+  position: 600,
+  duration: 3600,
+  updatedAt: 2000,
+  completed: false,
+  ...over,
+});
+
+beforeEach(() => {
+  data.channels.length = 0;
+  data.live.length = 0;
+  data.catchup.length = 0;
+  data.available = true;
+  epgMock.programmes = {};
+  epgMock.findChannelId.mockReset().mockReturnValue(null);
+  epgMock.catchupIdsKnown.mockReset().mockReturnValue(true);
+  archiveMock.load.mockClear();
+  archiveMock.isAvailable.mockClear().mockImplementation(() => data.available);
+  playlistMock.resolveChannelKey.mockClear();
+  storageMock.clearCatchupProgress.mockClear();
+});
+
+describe('RecentlyWatchedService.getItems', () => {
+  it('merges live and Catch-up entries by recency', () => {
+    const ch1 = channel();
+    const ch2 = channel({ id: 'ch2', name: 'Channel Bravo', url: 'http://host/b' });
+    data.channels.push(ch1, ch2);
+    data.live.push({ channelKey: channelKey(ch1), updatedAt: 3000 });
+    data.catchup.push(progress(ch2, { updatedAt: 4000 }));
+
+    const items = RecentlyWatchedService.getItems();
+
+    expect(items.map(item => item.kind)).toEqual(['catchup', 'live']);
+    expect(items.map(item => item.channelIndex)).toEqual([1, 0]);
+    expect(playlistMock.resolveChannelKey).toHaveBeenCalledTimes(2);
+  });
+
+  it('shows the entry in the filtered playlist among channels sharing a key', () => {
+    const first = channel();
+    const second = channel({ id: 'ch2', playlistIds: ['p2'], httpHeaders: { Referer: 'http://host/r' } });
+    data.channels.push(first, second);
+    data.live.push({ channelKey: channelKey(first), updatedAt: 3000 });
+
+    expect(RecentlyWatchedService.getItems('p2').map(item => item.channel)).toEqual([second]);
+    expect(RecentlyWatchedService.getItems().map(item => item.channel)).toEqual([first]);
+  });
+
+  it('filters both item types by playlist membership without changing order', () => {
+    const ch1 = channel({ playlistIds: ['p1'] });
+    const ch2 = channel({ id: 'ch2', url: 'http://host/b', playlistIds: ['p2'] });
+    data.channels.push(ch1, ch2);
+    data.live.push(
+      { channelKey: channelKey(ch2), updatedAt: 4000 },
+      { channelKey: channelKey(ch1), updatedAt: 3000 },
+    );
+    data.catchup.push(progress(ch1, { updatedAt: 2000 }));
+
+    const items = RecentlyWatchedService.getItems('p1');
+
+    expect(items.map(item => item.updatedAt)).toEqual([3000, 2000]);
+    expect(items.every(item => item.channel === ch1)).toBe(true);
+  });
+
+  it('omits completed, below-threshold, unresolved, and unavailable Catch-up entries', () => {
+    const ch = channel();
+    data.channels.push(ch);
+    data.catchup.push(
+      progress(ch, { progStart: 1, completed: true }),
+      progress(ch, { progStart: 2, position: 5 }),
+      progress(channel({ url: 'http://host/missing' }), { progStart: 3 }),
+      progress(ch, { progStart: 4 }),
+    );
+    data.available = false;
+
+    expect(RecentlyWatchedService.getItems()).toEqual([]);
+    expect(storageMock.clearCatchupProgress).toHaveBeenCalledWith(channelKey(ch), 4);
+  });
+
+  it('limits the visible merged list', () => {
+    for (let i = 0; i < 55; i++) {
+      const ch = channel({ id: `ch${String(i)}`, url: `http://host/${String(i)}` });
+      data.channels.push(ch);
+      data.live.push({ channelKey: channelKey(ch), updatedAt: i });
+    }
+    const items = RecentlyWatchedService.getItems();
+    expect(items).toHaveLength(50);
+    expect(items[0].updatedAt).toBe(54);
+  });
+});
+
+describe('RecentlyWatchedService.catchupInfo', () => {
+  it('loads availability and reconstructs resumable Catch-up metadata', async () => {
+    const ch = channel();
+    const item = {
+      kind: 'catchup' as const,
+      channel: ch,
+      channelIndex: 0,
+      progress: progress(ch),
+      updatedAt: 2000,
+    };
+
+    await expect(RecentlyWatchedService.catchupInfo(item)).resolves.toEqual({
+      start: 1000,
+      end: 4600,
+      title: 'Program Alpha',
+      description: 'Summary',
+      icon: '',
+      resumeSecs: 600,
+    });
+    expect(archiveMock.load).toHaveBeenCalledWith(ch);
+  });
+
+  it('restores the saved program catch-up id, or the guide one for older entries', async () => {
+    const ch = channel({ catchup: 'vod', catchupSource: '' });
+    const item = (over: Partial<CatchupProgressEntry>) => ({
+      kind: 'catchup' as const, channel: ch, channelIndex: 0, progress: progress(ch, over), updatedAt: 2000,
+    });
+
+    await expect(RecentlyWatchedService.catchupInfo(item({ catchupId: 'p1' })))
+      .resolves.toMatchObject({ catchupId: 'p1', resumeSecs: 600 });
+    expect(archiveMock.isAvailable).toHaveBeenLastCalledWith(ch, 1_000_000, expect.any(Number), 'p1');
+
+    epgMock.findChannelId.mockReturnValue('ch1');
+    epgMock.programmes = { ch1: [{
+      start: new Date(1_000_000), stop: new Date(4_600_000), title: 'Program Alpha',
+      description: '', category: '', icon: '', catchupId: 'p2',
+    } as never] };
+    await expect(RecentlyWatchedService.catchupInfo(item({})))
+      .resolves.toMatchObject({ catchupId: 'p2' });
+  });
+
+  it('skips the guide lookup for a channel whose URL needs no catch-up id', async () => {
+    epgMock.getProgrammeAtStart.mockClear();
+    const ch = channel();
+    data.channels.push(ch);
+    data.catchup.push(progress(ch));
+    RecentlyWatchedService.getItems();
+    await RecentlyWatchedService.catchupInfo({
+      kind: 'catchup', channel: ch, channelIndex: 0, progress: progress(ch), updatedAt: 2000,
+    });
+    expect(epgMock.findChannelId).not.toHaveBeenCalled();
+    expect(epgMock.getProgrammeAtStart).not.toHaveBeenCalled();
+  });
+
+  it('keeps an entry without an id until the guide can tell whether the program has one', () => {
+    const ch = channel({ catchup: 'default', catchupSource: 'http://host/v/{catchup-id}' });
+    data.channels.push(ch);
+    data.catchup.push(progress(ch));
+    archiveMock.isAvailable.mockImplementation((...args: unknown[]) => !!args[3]);
+    const start = new Date(1_000_000);
+    const guideProgram = { start, stop: new Date(4_600_000), title: 'Program Alpha',
+      description: '', category: '', icon: '' };
+
+    expect(RecentlyWatchedService.getItems()).toEqual([]);
+    epgMock.findChannelId.mockReturnValue('ch1');
+    epgMock.programmes = { ch1: [guideProgram] };
+    epgMock.catchupIdsKnown.mockReturnValue(false);
+    expect(RecentlyWatchedService.getItems()).toEqual([]);
+    expect(storageMock.clearCatchupProgress).not.toHaveBeenCalled();
+
+    epgMock.catchupIdsKnown.mockReturnValue(true);
+    expect(RecentlyWatchedService.getItems()).toEqual([]);
+    expect(storageMock.clearCatchupProgress).toHaveBeenCalledWith(channelKey(ch), 1_000_000);
+  });
+
+  it('resumes a vod entry by its saved id after the guide dropped the program', async () => {
+    const ch = channel({ catchup: 'vod', catchupSource: '' });
+    data.channels.push(ch);
+    data.catchup.push(progress(ch, { catchupId: 'p1' }));
+    archiveMock.isAvailable.mockImplementation((...args: unknown[]) => !!args[3]);
+    epgMock.findChannelId.mockReturnValue('ch1');
+    epgMock.programmes = {};
+
+    const [item] = RecentlyWatchedService.getItems();
+    expect(item).toMatchObject({ kind: 'catchup' });
+    await expect(RecentlyWatchedService.catchupInfo(item as Extract<typeof item, { kind: 'catchup' }>))
+      .resolves.toMatchObject({ catchupId: 'p1', resumeSecs: 600 });
+    expect(storageMock.clearCatchupProgress).not.toHaveBeenCalled();
+  });
+
+  it('removes an entry when archive metadata explicitly makes it unavailable', async () => {
+    const ch = channel();
+    const item = {
+      kind: 'catchup' as const,
+      channel: ch,
+      channelIndex: 0,
+      progress: progress(ch),
+      updatedAt: 2000,
+    };
+    archiveMock.load.mockImplementationOnce(async () => {
+      data.available = false;
+      return null;
+    });
+
+    await expect(RecentlyWatchedService.catchupInfo(item)).resolves.toBeNull();
+    expect(storageMock.clearCatchupProgress)
+      .toHaveBeenCalledWith(item.progress.channelKey, item.progress.progStart);
+  });
+});

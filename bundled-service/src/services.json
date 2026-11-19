@@ -1,0 +1,9 @@
+{
+  "id": "br.com.fidalgo.tv.service",
+  "description": "Bundled webOS JS service for fidalGO TV",
+  "services": [
+    {
+      "name": "br.com.fidalgo.tv.service"
+    }
+  ]
+}

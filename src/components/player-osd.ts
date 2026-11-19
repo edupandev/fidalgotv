@@ -1,0 +1,650 @@
+import type { CatchupInfo, Channel, Programme, VodQueueItem } from '../types';
+import { StorageService } from '../services/storage-service';
+import { $, hide, html, raw, type Safe, show } from '../utils/dom';
+import { type DvrState } from '../utils/dvr';
+import { morph } from '../utils/morph';
+import { formatDuration, formatPosition, formatTime, getProgress } from '../utils/time';
+import { t, tp } from '../i18n';
+import { NEXT_EPISODE_ICON, PAUSE_ICON, PLAY_ICON, PREVIOUS_EPISODE_ICON, RESYNC_ICON } from './icons';
+import type { SeekThumbnail } from '../services/seek-preview';
+import { CONFIG } from '../config';
+import { InputMode } from '../navigation/input-mode';
+
+const THUMB_WIDTH = CONFIG.PLAYER.SEEK_PREVIEW_WIDTH;
+const THUMB_HEIGHT = Math.round(THUMB_WIDTH * 9 / 16);
+
+export interface PlayerOsdSnapshot {
+  playback: {
+    position: number;
+    duration: number;
+    paused: boolean;
+  } | null;
+  channel: Channel | null;
+  channelNumber: number;
+  catchup: CatchupInfo | null;
+  vodTitle: string | null;
+  /** An episode's "S1 E2 · Title" under its series name in vodTitle. */
+  vodDetail: string;
+  upNextSeconds: number;
+  upNext: PlayerOsdUpNext | null;
+  /** Which episode skips are open; null when the VOD isn't an episode. */
+  episodeNav: { previous: boolean; next: boolean } | null;
+  dvr: DvrState | null;
+  nowPlaying: Programme | null;
+  upcoming: Programme | null;
+  streamInfo: PlayerOsdStreamInfo | null;
+  scrub: PlayerOsdScrub | null;
+}
+
+/** A seek target that has not been applied yet: pending Left/Right presses,
+ *  or the pointer hovering over the seek bar. */
+export interface PlayerOsdScrub {
+  fraction: number;
+  target: number;
+  delta: number | null;     // seconds from the playback position (key scrubbing only)
+  behindLive: number | null; // live DVR: the target's offset from the live edge
+  thumbnail: SeekThumbnail | null;
+}
+
+export interface PlayerOsdUpNext {
+  title: string;
+  detail: string;
+  image: string;
+  /** A movie's portrait poster rather than an episode still. */
+  poster: boolean;
+}
+
+// An episode reads as its series over "S1 E2 · Title"; anything saved without
+// its series name or number keeps its whole label.
+// An item saved before it carried its episode title still has it at the end of
+// its label, `Series — S1E2 — Title`.
+const LABEL_EPISODE_TITLE = / — S\d+E\d+ — (.+)$/;
+
+export function vodHeading(item: VodQueueItem): { title: string; detail: string } {
+  const series = item.watchlistOwner?.name;
+  const meta = item.searchMeta;
+  if (series && meta?.season !== undefined && meta.episode !== undefined) {
+    const code = `S${meta.season} E${meta.episode}`;
+    const episodeTitle = item.episodeTitle ?? LABEL_EPISODE_TITLE.exec(item.title)?.[1];
+    return { title: series, detail: episodeTitle ? `${code} · ${episodeTitle}` : code };
+  }
+  return { title: item.title, detail: '' };
+}
+
+export function upNextCard(item: VodQueueItem): PlayerOsdUpNext {
+  // A movie, or an episode without a still of its own, shows a portrait poster.
+  const poster = item.kind === 'vod' || (!!item.watchlistOwner?.poster && item.poster === item.watchlistOwner.poster);
+  return { ...vodHeading(item), image: item.poster, poster };
+}
+
+export interface PlayerOsdStreamInfo {
+  resolution: {
+    tier: string;
+    label: string;
+  } | null;
+  hdr: string;
+  drm: string;
+  fps: string;
+  videoCodec: string;
+  audioCodec: string;
+  audio: string;
+  subtitle: string;
+}
+
+export interface PlayerOsdOptions {
+  getSnapshot: () => PlayerOsdSnapshot;
+  canAutoReveal: () => boolean;
+  canSeek: () => boolean;
+  onSeekFraction: (fraction: number) => void;
+  onHoverFraction: (fraction: number | null) => void;
+  onPauseToggle: () => void;
+  onGoLive: () => void;
+  onResync: () => void;
+  onPlayNext: () => void;
+  onCancelNext: () => void;
+  onSkipEpisode: (step: 1 | -1) => void;
+}
+
+function audioTrackText(name: string): string {
+  const label = t('player.audioTrack');
+  return name === label || name.startsWith(`${label} `) ? name : `${label}: ${name}`;
+}
+
+export class PlayerOsd {
+  private visible = false;
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private message = false;
+  private pointerX: number | null = null;
+  private pointerY: number | null = null;
+  // Programme-icon URLs that failed to load, so a re-render omits them instead of
+  // re-requesting a broken image (which would thrash the OSD layout).
+  private failedIcons = new Set<string>();
+  private hoverFrame = 0;
+
+  constructor(private container: HTMLElement, private callbacks: PlayerOsdOptions) {
+    // Activate OSD controls on click by coordinate hit-test (vs e.target) since
+    // they sit over the video plane. The persistent container is marked so the
+    // global click handler skips this self-activating subtree.
+    container.setAttribute('data-self-activate', '');
+    // eslint-disable-next-line focus/no-raw-pointer-listener -- OSD auto-hide is an activity signal, not focus
+    container.addEventListener('mousemove', (e: MouseEvent) => {
+      this.pointerX = e.clientX;
+      this.pointerY = e.clientY;
+      // One hit-test and repaint per frame, however fast the pointer moves.
+      if (!this.hoverFrame) {
+        this.hoverFrame = requestAnimationFrame(() => {
+          this.hoverFrame = 0;
+          this.callbacks.onHoverFraction(this.seekbarFraction(this.pointerX, this.pointerY));
+        });
+      }
+      // An active cursor reveals the OSD (and its controls) so there's
+      // something to aim at; keep it up while the cursor keeps moving.
+      if (this.visible) this.resetTimer();
+      else if (this.callbacks.canAutoReveal()) this.show();
+    });
+    container.addEventListener('click', (e: MouseEvent) => this.onPointerRelease(e.clientX, e.clientY));
+    InputMode.onPointerGone(() => this.clearPointer());
+    // A broken programme icon: record its URL (capture — `error` doesn't bubble)
+    // and re-render so morph drops it and never re-requests it.
+    container.addEventListener('error', (e: Event) => {
+      const target = e.target as HTMLElement | null;
+      if (!(target instanceof HTMLImageElement) ||
+          !target.classList.contains('osd-programme-icon')) return;
+      const src = target.getAttribute('src');
+      if (src && !this.failedIcons.has(src)) {
+        this.failedIcons.add(src);
+        if (this.visible) this.render();
+      }
+    }, true);
+  }
+
+  isVisible(): boolean {
+    return this.visible;
+  }
+
+  // A status message (reconnecting, stream error) rather than playback info.
+  showsMessage(): boolean {
+    return this.visible && this.message;
+  }
+
+  pointerPosition(): { x: number | null; y: number | null } {
+    return { x: this.pointerX, y: this.pointerY };
+  }
+
+  clearPointer(): void {
+    this.cancelHoverFrame();
+    if (this.pointerX !== null) this.callbacks.onHoverFraction(null);
+    this.pointerX = null;
+    this.pointerY = null;
+  }
+
+  clearFailedIcons(): void {
+    this.failedIcons.clear();
+  }
+
+  show(): void {
+    this.visible = true;
+    this.render();
+    const osd = $('#player-osd', this.container);
+    if (osd) show(osd);
+    // Rendered while hidden, the bubble measured nothing.
+    this.placeBubble();
+    this.resetTimer();
+  }
+
+  hide(): void {
+    this.visible = false;
+    this.cancelHoverFrame();
+    this.callbacks.onHoverFraction(null);
+    const osd = $('#player-osd', this.container);
+    if (osd) hide(osd);
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+  }
+
+  private cancelHoverFrame(): void {
+    if (this.hoverFrame) cancelAnimationFrame(this.hoverFrame);
+    this.hoverFrame = 0;
+  }
+
+  toggle(): void {
+    if (this.visible) this.hide(); else this.show();
+  }
+
+  resetTimer(): void {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+    // Keep the OSD up while paused (live DVR or catch-up): nothing to fall behind.
+    if (this.callbacks.getSnapshot().playback?.paused) return;
+    this.timer = setTimeout(() => this.hide(), StorageService.getPlayerOsdTimeoutMs());
+  }
+
+  render(): void {
+    this.renderOsd();
+    this.placeBubble();
+  }
+
+  private renderOsd(): void {
+    const osd = $('#player-osd', this.container);
+    if (!osd) return;
+    this.message = false;
+    const state = this.callbacks.getSnapshot();
+    if (state.vodTitle !== null) {
+      this.renderVod(osd, state);
+      return;
+    }
+    if (!state.channel) return;
+
+    let programmeHtml: string | Safe = '';
+    if (state.catchup) {
+      // Catch-up playback: show the selected programme's info. The bar tracks the
+      // video's playback position (a seekable VOD), not wall-clock time.
+      const catchup = state.catchup;
+      const start = new Date(catchup.start * 1000);
+      const end = new Date(catchup.end * 1000);
+      const playback = state.playback;
+      const dur = playback && Number.isFinite(playback.duration) && playback.duration > 0
+        ? playback.duration
+        : catchup.end - catchup.start;
+      const pos = playback ? Math.min(playback.position, dur) : 0;
+      programmeHtml = html`
+        <div class="osd-programme">
+          <div class="osd-now-label">${t('common.catchup')}</div>
+          <div class="osd-programme-detail">
+            ${this.programmeIcon(catchup.icon)}
+            <div class="osd-programme-info">
+              <div class="osd-programme-title">${catchup.title}</div>
+              <div class="osd-programme-time">
+                <span>${formatTime(start)} - ${formatTime(end)}</span>
+                <span class="osd-remaining">${formatDuration(end.getTime() - start.getTime())}</span>
+              </div>
+            </div>
+          </div>
+          ${this.positionRow(pos, dur, state.playback?.paused ?? false, state.scrub)}
+          ${catchup.description ? html`<div class="osd-description">${catchup.description}</div>` : ''}
+        </div>
+      `;
+    } else if (state.nowPlaying || state.dvr) {
+      // Live playback. Show EPG programme info, and a DVR timeshift bar when the
+      // stream exposes a usable seekable window.
+      const nowPlaying = state.nowPlaying;
+      const next = state.upcoming ? html`
+        <div class="osd-next">
+          <span class="osd-next-label">${t('player.next')}</span>
+          <span class="osd-next-title">${state.upcoming.title}
+            <span class="osd-next-time">${formatTime(state.upcoming.start)}</span>
+          </span>
+        </div>
+      ` : '';
+      const detail = nowPlaying ? html`
+        <div class="osd-programme-detail">
+          ${this.programmeIcon(nowPlaying.icon)}
+          <div class="osd-programme-info">
+            <div class="osd-programme-title">${nowPlaying.title}</div>
+            <div class="osd-programme-time">
+              <span>${formatTime(nowPlaying.start)} - ${formatTime(nowPlaying.stop)}</span>
+              <span class="osd-remaining">${t('player.remaining', {
+                duration: formatDuration(nowPlaying.stop.getTime() - Date.now()),
+              })}</span>
+            </div>
+          </div>
+        </div>
+      ` : '';
+      const progressRow = state.dvr
+        ? this.dvrProgressRow(state.dvr, state.playback?.paused ?? false, state.scrub)
+        : nowPlaying ? html`
+          <div class="osd-progress-row">
+            <span class="osd-time-current">${formatTime(new Date())}</span>
+            <div class="osd-progress">
+              <div class="osd-progress-bar"
+                style="width: ${getProgress(nowPlaying.start, nowPlaying.stop) * 100}%"></div>
+            </div>
+            <span class="osd-time-end">${formatTime(nowPlaying.stop)}</span>
+          </div>
+        ` : '';
+      programmeHtml = html`
+        <div class="osd-programme">
+          <div class="osd-now-label">${t(state.dvr && !state.dvr.atLiveEdge
+            ? 'player.timeshift'
+            : 'player.now')}</div>
+          ${detail}
+          ${progressRow}
+          ${nowPlaying?.description
+            ? html`<div class="osd-description">${nowPlaying.description}</div>`
+            : ''}
+        </div>
+        ${next}
+      `;
+    }
+
+    morph(osd, html`
+      <div class="osd-channel">
+        <div class="osd-channel-number">${state.channelNumber}</div>
+        ${state.channel.logo
+          ? html`<img class="osd-channel-logo" src="${state.channel.logo}" alt="">`
+          : ''}
+        <div class="osd-channel-name">${state.channel.name}</div>
+        ${this.renderStreamInfo(state.streamInfo)}
+      </div>
+      ${programmeHtml}
+    `);
+  }
+
+  updateMessage(message: string): void {
+    const osd = $('#player-osd', this.container);
+    if (!osd) return;
+    morph(osd, html`<div class="osd-message">${message}</div>`);
+    this.message = true;
+    // Keep the OSD visible so metadata can repaint over this once the stream
+    // recovers (else "Reconnecting..." sticks) and it auto-hides otherwise.
+    this.visible = true;
+    show(osd);
+    this.resetTimer();
+  }
+
+  refreshProgress(): void {
+    if (!this.visible) return;
+    const state = this.callbacks.getSnapshot();
+    const playback = state.playback;
+    if (!playback) return;
+    if (state.vodTitle !== null) {
+      const dur = Number.isFinite(playback.duration) ? playback.duration : 0;
+      this.setProgress(dur > 0 ? Math.min(playback.position, dur) / dur : 0);
+      const current = $('.osd-time-current', this.container);
+      if (current) current.textContent = formatPosition(playback.position);
+      this.updateScrub(state.scrub);
+      return;
+    }
+    const hasDvrBar = !!$('[data-golive]', this.container);
+    // DVR availability can flip after the OSD is already open (the seekable
+    // window fills in a beat after tune-in). When the current layout no longer
+    // matches, do a full render so the DVR bar appears/disappears on its own.
+    if (!!state.dvr !== hasDvrBar) {
+      this.render();
+      return;
+    }
+    if (state.dvr) {
+      this.setProgress(state.dvr.fraction);
+      const behind = $('.osd-dvr-behind', this.container);
+      if (behind) {
+        behind.textContent = state.dvr.atLiveEdge
+          ? t('common.live')
+          : `-${formatPosition(state.dvr.behindLive)}`;
+      }
+      const live = $('.osd-dvr-live', this.container) as HTMLElement | null;
+      if (live) live.classList.toggle('is-live', state.dvr.atLiveEdge);
+      this.updateScrub(state.scrub);
+      return;
+    }
+    if (!state.catchup) return;
+    this.updateScrub(state.scrub);
+    if (!Number.isFinite(playback.duration) || playback.duration <= 0) return;
+    this.setProgress(Math.min(playback.position, playback.duration) / playback.duration);
+    const current = $('.osd-time-current', this.container);
+    if (current) current.textContent = formatPosition(playback.position);
+  }
+
+  /** Seek to the bar position under (x, y) when it's over the seek bar; returns
+   *  whether it seeked. Used by both pointer clicks and OK over the bar. */
+  seekAtPointer(x: number | null, y: number | null): boolean {
+    const fraction = this.seekbarFraction(x, y);
+    if (fraction === null) return false;
+    this.callbacks.onSeekFraction(fraction);
+    return true;
+  }
+
+  /** The seek-bar fraction under (x, y), or null when off the bar. */
+  private seekbarFraction(x: number | null, y: number | null): number | null {
+    if (x === null || y === null || !this.visible || !this.callbacks.canSeek()) return null;
+    const bar = $('[data-seekbar]', this.container) as HTMLElement | null;
+    if (!bar) return null;
+    const rect = bar.getBoundingClientRect();
+    const margin = 20;
+    const hit = rect.width > 0 && x >= rect.left && x <= rect.right &&
+      y >= rect.top - margin && y <= rect.bottom + margin;
+    return hit ? (x - rect.left) / rect.width : null;
+  }
+
+  private scrubHost(scrub: PlayerOsdScrub | null): Safe {
+    return html`<div class="osd-scrub-host" data-scrub-host>${this.scrubMarker(scrub)}</div>`;
+  }
+
+  private updateScrub(scrub: PlayerOsdScrub | null): void {
+    const host = $('[data-scrub-host]', this.container) as HTMLElement | null;
+    if (host) morph(host, this.scrubMarker(scrub));
+    this.placeBubble();
+  }
+
+  // Center the bubble on the knob, pushed inward only where it would overhang
+  // either end of the bar.
+  private placeBubble(): void {
+    const marker = $('[data-scrub]', this.container) as HTMLElement | null;
+    const host = marker?.parentElement;
+    const bubble = marker && $('.osd-scrub-bubble', marker) as HTMLElement | null;
+    if (!marker || !host || !bubble) return;
+    const width = bubble.offsetWidth;
+    const knob = marker.offsetLeft;
+    const left = Math.max(0, Math.min(host.clientWidth - width, knob - width / 2));
+    bubble.style.transform = `translateX(${Math.round(left - knob)}px)`;
+  }
+
+  // A ghost knob at the pending target with a bubble above it: the server's
+  // preview frame when one is available, the target time, and how far it is
+  // from the playback position.
+  private scrubMarker(scrub: PlayerOsdScrub | null): Safe {
+    if (!scrub) return html``;
+    const pct = Math.max(0, Math.min(1, scrub.fraction)) * 100;
+    const time = scrub.behindLive === null
+      ? formatPosition(scrub.target)
+      : scrub.behindLive < 1 ? t('common.live') : `-${formatPosition(scrub.behindLive)}`;
+    const delta = scrub.delta === null || Math.abs(scrub.delta) < 1 ? ''
+      : `${scrub.delta > 0 ? '+' : '-'}${formatPosition(Math.abs(scrub.delta))}`;
+    return html`
+      <div class="osd-scrub" data-scrub style="left: ${pct}%">
+        <div class="osd-scrub-bubble">
+          ${this.scrubThumbnail(scrub.thumbnail)}
+          <div class="osd-scrub-label">
+            <span class="osd-scrub-time">${time}</span>
+            ${delta ? html`<span class="osd-scrub-delta">${delta}</span>` : ''}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  private scrubThumbnail(thumb: SeekThumbnail | null): Safe | string {
+    if (!thumb) return '';
+    const tile = thumb.tile;
+    if (!tile) {
+      return html`
+        <div class="osd-scrub-thumb" style="width: ${THUMB_WIDTH}px; height: ${THUMB_HEIGHT}px">
+          <img class="osd-scrub-image osd-scrub-image--fit" data-key="thumb:${thumb.url}"
+            src="${thumb.url}" alt="">
+        </div>
+      `;
+    }
+    // A sprite sheet: scale the sheet so one tile fills the frame, and shift it
+    // so that tile shows through the frame's clipped window.
+    const scale = THUMB_WIDTH / tile.w;
+    const height = Math.round(tile.h * scale);
+    return html`
+      <div class="osd-scrub-thumb" style="width: ${THUMB_WIDTH}px; height: ${height}px">
+        <img class="osd-scrub-image" data-key="thumb:${thumb.url}" src="${thumb.url}" alt=""
+          style="width: ${Math.round(thumb.width * scale)}px; height: ${Math.round(thumb.height * scale)}px; left: ${-Math.round(tile.x * scale)}px; top: ${-Math.round(tile.y * scale)}px">
+      </div>
+    `;
+  }
+
+  // The VOD OSD reuses the Live markup: an `.osd-channel` header (movie/episode
+  // title + shared stream-info) over the shared seekable `.osd-progress-row`.
+  private renderVod(osd: HTMLElement, state: PlayerOsdSnapshot): void {
+    if (state.upNextSeconds > 0 && state.upNext) {
+      const next = state.upNext;
+      const image = next.image && !this.failedIcons.has(next.image) ? next.image : '';
+      morph(osd, html`
+        <div class="osd-next-episode">
+          ${image ? html`<img class="osd-programme-icon osd-next-episode-thumb${next.poster ? ' is-poster' : ''}"
+            data-key="next-thumb:${image}" src="${image}" alt="">` : ''}
+          <div class="osd-next-episode-body">
+            <div class="osd-next-episode-label">${t('player.upNext')}</div>
+            <div class="osd-channel-name osd-next-episode-title">${next.title}</div>
+            ${next.detail ? html`<div class="osd-vod-detail">${next.detail}</div>` : ''}
+            <div class="osd-next-episode-time">${tp('player.playingIn', state.upNextSeconds)}</div>
+            <div class="osd-next-episode-actions">
+              <button data-next-play><span class="osd-next-episode-icon">${raw(PLAY_ICON)}</span><span>${t('player.playNow')}</span></button>
+              <button data-next-cancel>${t('common.cancel')}</button>
+            </div>
+          </div>
+        </div>
+      `);
+      return;
+    }
+    const playback = state.playback;
+    const dur = playback && Number.isFinite(playback.duration) ? playback.duration : 0;
+    const pos = playback ? Math.min(playback.position, dur || Infinity) : 0;
+    morph(osd, html`
+      <div class="osd-channel">
+        <div class="osd-channel-name">${state.vodTitle ?? ''}</div>
+        ${this.renderStreamInfo(state.streamInfo)}
+      </div>
+      ${state.vodDetail ? html`<div class="osd-vod-detail">${state.vodDetail}</div>` : ''}
+      <div class="osd-progress-row">
+        ${state.episodeNav ? this.episodeButton(-1, state.episodeNav.previous) : ''}
+        ${this.playPauseButton(playback?.paused ?? false)}
+        ${state.episodeNav ? this.episodeButton(1, state.episodeNav.next) : ''}
+        <span class="osd-time-current">${formatPosition(pos)}</span>
+        <div class="osd-progress" data-seekbar>
+          <div class="osd-progress-bar" style="width: ${dur > 0 ? (pos / dur) * 100 : 0}%"></div>
+          ${this.scrubHost(state.scrub)}
+        </div>
+        <span class="osd-time-end">${dur > 0 ? formatPosition(dur) : ''}</span>
+        ${this.resyncButton()}
+      </div>
+    `);
+  }
+
+  /** The programme icon `<img>`, or nothing if it has no URL or that URL already
+   *  failed to load. Keyed by URL so morph reuses a loaded icon across re-renders
+   *  (no reload/flicker); the delegated error listener drops a broken one. */
+  private programmeIcon(url: string): Safe | string {
+    if (!url || this.failedIcons.has(url)) return '';
+    return html`<img class="osd-programme-icon" data-key="prog-icon:${url}" src="${url}" alt="">`;
+  }
+
+  /** The shared OSD play/pause button (live DVR and catch-up). Pointer-hit-tested
+   *  by onPointerRelease and toggled by OK from Player.handleAction. */
+  private playPauseButton(paused: boolean): Safe {
+    return html`
+      <button class="osd-dvr-btn" data-playpause
+        aria-label="${t(paused ? 'player.play' : 'player.pause')}">
+        ${paused ? raw(PLAY_ICON) : raw(PAUSE_ICON)}
+      </button>
+    `;
+  }
+
+  // Kept, disabled, at either end of the season list so play/pause never moves.
+  private episodeButton(step: 1 | -1, enabled: boolean): Safe {
+    return html`
+      <button class="osd-dvr-btn osd-episode-btn" data-skip-episode="${step}" ${raw(enabled ? '' : 'disabled')}
+        aria-label="${t(step > 0 ? 'player.nextEpisode' : 'player.previousEpisode')}">
+        ${raw(step > 0 ? NEXT_EPISODE_ICON : PREVIOUS_EPISODE_ICON)}
+      </button>
+    `;
+  }
+
+  /** The OSD "Resync A/V" button (catch-up + VOD only). Pointer-hit-tested by
+   *  onPointerRelease; invokes Player.resyncAV() through the callback. */
+  private resyncButton(): Safe {
+    return html`
+      <button class="osd-resync-btn" data-resync aria-label="${t('player.resync')}">
+        ${raw(RESYNC_ICON)}
+      </button>
+    `;
+  }
+
+  // A catch-up seek bar: position, the bar, and the duration.
+  private positionRow(pos: number, dur: number, paused: boolean, scrub: PlayerOsdScrub | null): Safe {
+    return html`
+      <div class="osd-progress-row">
+        ${this.playPauseButton(paused)}
+        <span class="osd-time-current">${formatPosition(pos)}</span>
+        <div class="osd-progress" data-seekbar>
+          <div class="osd-progress-bar" style="width: ${dur > 0 ? pos / dur * 100 : 0}%"></div>
+          ${this.scrubHost(scrub)}
+        </div>
+        <span class="osd-time-end">${formatPosition(dur)}</span>
+        ${this.resyncButton()}
+      </div>
+    `;
+  }
+
+  private dvrProgressRow(state: DvrState, paused: boolean, scrub: PlayerOsdScrub | null): Safe {
+    return html`
+      <div class="osd-progress-row osd-dvr-row">
+        ${this.playPauseButton(paused)}
+        <span class="osd-time-current osd-dvr-behind">${state.atLiveEdge
+          ? t('common.live')
+          : `-${formatPosition(state.behindLive)}`}</span>
+        <div class="osd-progress" data-seekbar>
+          <div class="osd-progress-bar" style="width: ${state.fraction * 100}%"></div>
+          ${this.scrubHost(scrub)}
+        </div>
+        <button class="osd-time-end osd-dvr-live ${state.atLiveEdge ? 'is-live' : ''}"
+          data-golive aria-label="${t('player.goLive')}">${t('common.live')}</button>
+      </div>
+    `;
+  }
+
+  // The stream-info badges (resolution / HDR / DRM / fps / codecs / audio / subtitle),
+  // shared by the Live and VOD OSD.
+  private renderStreamInfo(info: PlayerOsdStreamInfo | null): Safe | string {
+    if (!info) return '';
+    return html`
+      <div class="osd-stream-info">
+        ${info.resolution
+          ? html`<span class="si-badge si-badge--${info.resolution.tier}">${
+              info.resolution.label
+            }</span>`
+          : ''}
+        ${info.hdr ? html`<span class="si-badge si-badge--hdr">${info.hdr}</span>` : ''}
+        ${info.drm ? html`<span class="si-pill">${info.drm}</span>` : ''}
+        ${info.fps ? html`<span class="si-pill">${info.fps}fps</span>` : ''}
+        ${info.videoCodec ? html`<span class="si-pill">${info.videoCodec}</span>` : ''}
+        ${info.audioCodec ? html`<span class="si-pill">${info.audioCodec}</span>` : ''}
+        ${info.audio ? html`<span class="si-text">${audioTrackText(info.audio)}</span>` : ''}
+        ${info.subtitle ? html`<span class="si-text">${t('player.subtitlesTrack', { name: info.subtitle })}</span>` : ''}
+      </div>
+    `;
+  }
+
+  private setProgress(fraction: number): void {
+    const bar = $('.osd-progress-bar', this.container) as HTMLElement | null;
+    if (bar) bar.style.width = `${fraction * 100}%`;
+  }
+
+  /** A pointer release: seek if it landed on the bar, else activate the play/pause,
+   *  Go-to-Live, or resync control under it. Coordinates are used because the OSD
+   *  controls sit over the video plane. */
+  private onPointerRelease(x: number, y: number): void {
+    const state = this.callbacks.getSnapshot();
+    if (state.upNextSeconds > 0) {
+      if (this.hitsControl('[data-next-play]', x, y)) this.callbacks.onPlayNext();
+      else if (this.hitsControl('[data-next-cancel]', x, y)) this.callbacks.onCancelNext();
+      return;
+    }
+    if (this.seekAtPointer(x, y)) return;
+    if (this.hitsControl('[data-playpause]', x, y)) this.callbacks.onPauseToggle();
+    else if (this.hitsControl('[data-skip-episode="-1"]:not([disabled])', x, y)) this.callbacks.onSkipEpisode(-1);
+    else if (this.hitsControl('[data-skip-episode="1"]:not([disabled])', x, y)) this.callbacks.onSkipEpisode(1);
+    else if (this.hitsControl('[data-golive]', x, y)) this.callbacks.onGoLive();
+    else if (this.hitsControl('[data-resync]', x, y)) this.callbacks.onResync();
+  }
+
+  private hitsControl(selector: string, x: number, y: number): boolean {
+    const element = $(selector, this.container) as HTMLElement | null;
+    if (!element) return false;
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && x >= rect.left && x <= rect.right &&
+      y >= rect.top && y <= rect.bottom;
+  }
+}
