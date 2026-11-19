@@ -116,9 +116,10 @@ class App {
 
   private seedDefaultFidalgoAccount(): void {
     try {
-      const nav = typeof navigator !== 'undefined' ? (navigator as unknown as Record<string, unknown>) : null;
       const forceSeed = typeof location !== 'undefined' && location.search.indexOf('fidalgo_seed=1') >= 0;
-      if (nav && nav['webdriver'] && !forceSeed) return;
+      // Em builds de preview/E2E (--preview), só faz auto-seed quando ?fidalgo_seed=1 é passado.
+      // No pacote real da TV LG webOS (.ipk), __ENABLE_PSEUDO_LOCALE__ é false e sempre pré-configura.
+      if (__ENABLE_PSEUDO_LOCALE__ && !forceSeed) return;
       const seedKey = `${CONFIG.STORAGE_PREFIX}fidalgo_seeded`;
       if (localStorage.getItem(seedKey) === '1') return;
       if (StorageService.getPlaylists().length === 0) {
