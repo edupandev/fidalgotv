@@ -248,7 +248,7 @@ test('dev-mode query replaces the reminder fallback activity', async ({ page }) 
   expect(devAlert.name).toBe(fallback.name);
   expect(fallback.replace).toBe(true);
   expect(devAlert.replace).toBe(true);
-  expect(devAlert.method).toBe('luna://com.lennylxx.iptv.service/fireReminderAlert');
+  expect(devAlert.method).toBe('luna://br.com.fidalgo.tv.service/fireReminderAlert');
 });
 
 // The parsed-playlist write is deferred, so wait for it before ageing it.

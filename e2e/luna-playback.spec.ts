@@ -32,7 +32,7 @@ interface FakeUmsOptions {
   service?: Record<string, string>;
 }
 
-const APP_ID = 'com.lennylxx.iptv';
+const APP_ID = 'br.com.fidalgo.tv';
 const WINDOW_ID = '_Window_Id_3';
 const START_MS = 10000;
 
@@ -110,7 +110,7 @@ async function installFakeUms(page: Page, options: FakeUmsOptions): Promise<void
         const mediaId = typeof params.mediaId === 'string' ? params.mediaId : '';
         const item = media.get(mediaId);
         const ok = { returnValue: true, mediaId };
-        if (uri === `luna://${'com.lennylxx.iptv.service'}/fetchManifest`) {
+        if (uri === `luna://${'br.com.fidalgo.tv.service'}/fetchManifest`) {
           probe.calls.push({ method, params });
           const text = options.service?.[String(params.url)];
           this.answer(method, text === undefined
