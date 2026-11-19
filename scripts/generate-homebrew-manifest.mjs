@@ -22,7 +22,7 @@ if (basename(ipkPath) !== expectedIpk) {
 }
 
 const ipkHash = createHash('sha256').update(readFileSync(ipkPath)).digest('hex');
-const repoSlug = process.env.GITHUB_REPOSITORY || 'SEU_USUARIO/fidalgo-webos-lg';
+const repoSlug = process.env.GITHUB_REPOSITORY || 'edupandev/fidalgotv';
 
 const manifest = {
   id: appInfo.id,

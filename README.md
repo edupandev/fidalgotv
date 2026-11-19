@@ -16,7 +16,7 @@ Aplicativo nativo de IPTV, Filmes, Séries e Animes para TVs **LG webOS (4.0 ou 
 3. Informe a URL abaixo:
 
 ```text
-https://raw.githubusercontent.com/SEU_USUARIO/fidalgo-webos-lg/main/homebrew-repository.json
+https://raw.githubusercontent.com/edupandev/fidalgotv/main/homebrew-repository.json
 ```
 
 4. Volte para a lista de aplicativos do Homebrew Channel, procure **fidalGO TV** e clique em **Install (Instalar)**.
